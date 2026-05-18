@@ -384,23 +384,18 @@
 
     const tenant = document.getElementById('tenant').value.trim();
     const user = document.getElementById('uname').value.trim();
-    await post(`/Thread/${threadId}/add_message`, {
-      participant_id: user,
-      participant_type: 'HUMAN',
-      role: 'USER',
-      content: {
-        version: 1,
-        parts: [{
-          type: 'response_reply',
-          request_id: requestId,
-          selected: [selectedId],
-          created_by: agentParticipantId,
-        }]
-      },
-      idempotency_key: `hitl-${requestId}-${selectedId}-${Date.now()}`,
-      tenant_id: tenant,
-      user_name: user,
-      agent_id: agentParticipantId,
+    await fetch(`/api/${tenant}/channels/web/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Tenant-Id': tenant, 'X-User-Name': user },
+      body: JSON.stringify({
+        thread_id: threadId,
+        participant_id: user,
+        agent_id: agentParticipantId,
+        content: {
+          version: 1,
+          parts: [{ type: 'response_reply', request_id: requestId, selected: [selectedId] }],
+        },
+      }),
     });
   }
 

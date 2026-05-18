@@ -51,7 +51,9 @@ class _BindRequest(BaseModel):
 
 
 class _SendMessageRequest(BaseModel):
-    content: dict
+    thread_id: str
+    text: str = ""
+    content: dict | None = None  # if set, used as-is; otherwise built from text
     participant_id: str = ""
     agent_id: str = "stub"
 
@@ -96,7 +98,7 @@ class WebAdapter(BaseChannelAdapter):
         @router.post("/{tenant_id}/channels/web/send")
         async def send(
             tenant_id: str,
-            body: _SendRequest,
+            body: _SendMessageRequest,
             request: Request,
             background_tasks: BackgroundTasks,
         ) -> JSONResponse:
@@ -108,12 +110,13 @@ class WebAdapter(BaseChannelAdapter):
             if not header_user:
                 raise HTTPException(status_code=401, detail="X-User-Name header required")
 
+            content = body.content or {"version": 1, "parts": [{"type": "text", "text": body.text}]}
             ikey = hashlib.sha256(
-                f"{body.thread_id}:{body.participant_id or header_user}:{body.text[:128]}".encode()
+                f"{body.thread_id}:{body.participant_id or header_user}:{str(content)[:128]}".encode()
             ).hexdigest()[:16]
             background_tasks.add_task(
                 self.receive,
-                content={"version": 1, "parts": [{"type": "text", "text": body.text}]},
+                content=content,
                 thread_id=body.thread_id,
                 tenant_id=tenant_id,
                 participant_id=body.participant_id or header_user,
