@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <head>
-  <title>Ironbridge</title>
+  <title>Ironbridges</title>
   <script src="https://js.pusher.com/8.4.0/pusher.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
@@ -58,7 +58,7 @@
 <body>
 
 <header>
-  IRONBRIDGE
+  IRONBRIDGES
   <div id="dot"></div>
   <span id="conn" style="font-size:12px;opacity:0.6">disconnected</span>
 </header>
@@ -107,7 +107,8 @@
 
   async function loadThreadList() {
     const tenant = document.getElementById('tenant').value.trim();
-    const data = await post(`/Thread/_/list`, { tenant_id: tenant });
+    const user = document.getElementById('uname').value.trim();
+    const data = await post(`/Thread/_/list`, { tenant_id: tenant, user_name: user });
     const list = document.getElementById('thread-list');
     list.innerHTML = '';
     for (const t of (data.threads || [])) {

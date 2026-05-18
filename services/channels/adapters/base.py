@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 import httpx
 from cuid2 import cuid_wrapper
 
+from ironbridge.platform.channels.channel import Channel
 from ironbridge.platform.channels.channel_binding import ChannelBinding
 from ironbridge.platform.channels.context import ChannelContext
 from ironbridge.platform.channels.message import ChannelMessage
@@ -28,6 +29,19 @@ _cuid = cuid_wrapper()
 
 class BaseChannelAdapter(ABC):
     channel_type: str  # must override — matches Channel.channel_type in DB
+
+    def get_or_create_channel(self, tenant_id: str) -> str:
+        """Return the channel_id for this adapter's channel_type, creating it if needed."""
+        with tenant_session(tenant_id) as db:
+            repo = SqlAlchemyRepository(db, Channel)
+            existing = repo.find_by(channel_type=self.channel_type)
+            if existing:
+                return existing.id
+            ch = Channel()
+            ch.create(name=self.channel_type.capitalize(), channel_type=self.channel_type)
+            repo.save(ch)
+            db.commit()
+            return ch.id
 
     def new_thread(
         self,

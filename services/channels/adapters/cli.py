@@ -76,7 +76,11 @@ def run_cli(
     restate_url: str | None = None,
 ) -> None:
     adapter = CliAdapter()
-    thread_id = thread_id or ("thread-cli-" + _cuid()[:8])
+    channel_id = adapter.get_or_create_channel(tenant_id)
+    if thread_id:
+        adapter.bind_thread(tenant_id, thread_id, channel_id)
+    else:
+        thread_id = adapter.new_thread(tenant_id, channel_id)
     n = 0
 
     print(f"{DIM}thread: {thread_id}  agent: {agent_id}{RESET}", flush=True)

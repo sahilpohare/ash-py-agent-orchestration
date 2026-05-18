@@ -46,6 +46,10 @@ class _CreateThreadRequest(BaseModel):
     channel_id: str
 
 
+class _BindRequest(BaseModel):
+    thread_id: str
+
+
 class _SendMessageRequest(BaseModel):
     content: dict
     participant_id: str = ""
@@ -85,7 +89,8 @@ class WebAdapter(BaseChannelAdapter):
             if not header_tenant or header_tenant != tenant_id:
                 raise HTTPException(status_code=403, detail="Tenant mismatch")
 
-            self.bind_thread(tenant_id, body.thread_id, body.channel_id)
+            channel_id = self.get_or_create_channel(tenant_id)
+            self.bind_thread(tenant_id, body.thread_id, channel_id)
             return JSONResponse({"ok": True})
 
         @router.post("/{tenant_id}/channels/web/send")
