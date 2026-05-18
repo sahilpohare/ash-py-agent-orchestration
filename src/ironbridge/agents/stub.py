@@ -18,6 +18,7 @@ from datetime import timedelta
 from ironbridge.platform.agents.base import BaseAgent
 from ironbridge.platform.agents.context import AgentContext
 from ironbridge.platform.agents.registry import agent_registry
+from ironbridge.platform.sessions.thread import MessageView
 
 APPROVAL_REQUIRED = {"write_file", "delete_rows", "read_db", "send_email"}
 
@@ -131,13 +132,13 @@ class StubAgent(BaseAgent):
 
 # ── Stubs — replace with real LLM/tool implementations ────────────────────────
 
-def _call_llm(history: list) -> dict | None:
+def _call_llm(history: list[MessageView]) -> dict | None:
     if not history:
         return None
     last = history[-1]
-    if last.get("role") != "USER":
+    if last.role != "USER":
         return {"content": "", "tool_calls": [], "done": True, "raw": None}
-    parts = last.get("content", {}).get("parts", [])
+    parts = last.content.get("parts", [])
     text = next((p.get("text", "") for p in parts if p.get("type") == "text"), "")
     if "choose" in text.lower() or "pick" in text.lower() or "options" in text.lower():
         return {

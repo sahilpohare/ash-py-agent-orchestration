@@ -87,8 +87,8 @@ class WeatherAgent(BaseAgent):
             {"role": "system", "content": "You are a helpful weather assistant. Use get_weather when the user asks about weather."},
         ]
         for m in history:
-            role = "user" if m.get("role") == "USER" else "assistant"
-            parts = m.get("content", {}).get("parts", [])
+            role = "user" if m.role == "USER" else "assistant"
+            parts = m.content.get("parts", [])
             text = next((p.get("text", "") for p in parts if p.get("type") == "text"), "")
             if text:
                 messages.append({"role": role, "content": text})

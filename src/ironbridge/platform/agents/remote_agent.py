@@ -52,7 +52,7 @@ class RemoteAgent(BaseAgent):
                 thread_id=ctx.thread_id,
                 tenant_id=ctx.tenant_id,
                 history=[
-                    HistoryMessage(role=m["role"], content=m["content"])
+                    HistoryMessage(role=m.role, content=m.content)
                     for m in history
                 ],
                 tool_results=tool_results,

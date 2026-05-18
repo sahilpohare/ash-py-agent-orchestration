@@ -238,12 +238,13 @@ def test_add_message_ids_are_unique():
 
 # ── Thread.get ────────────────────────────────────────────────────────────────
 
-def test_get_returns_self():
+def test_get_returns_thread_view():
+    from ironbridge.platform.sessions.thread import ThreadView
     t = make_thread()
     result = t.get()
-    assert isinstance(result, dict)
-    assert result["id"] == t.id
-    assert "messages" in result
+    assert isinstance(result, ThreadView)
+    assert result.id == t.id
+    assert isinstance(result.messages, list)
 
 
 # ── Action metadata ───────────────────────────────────────────────────────────

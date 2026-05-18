@@ -4,6 +4,7 @@ from cuid2 import cuid_wrapper
 from pydantic import BaseModel
 from sqlalchemy import DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from typing_extensions import List
 
 from ironbridge.platform.channels.channel import resolve_agent_for_channel
 from ironbridge.platform.channels.channel_binding import resolve_channels_for_thread
@@ -25,7 +26,7 @@ class ThreadView(BaseModel):
     id: str
     created_at: str | None
     updated_at: str | None
-    messages: list[MessageView]
+    messages: List[MessageView]
 
 
 class ThreadSummary(BaseModel):
@@ -35,7 +36,7 @@ class ThreadSummary(BaseModel):
 
 
 class ThreadListResult(BaseModel):
-    threads: list[ThreadSummary]
+    threads: List[ThreadSummary]
 
 
 class AddMessageRequest(BaseModel):
@@ -47,6 +48,7 @@ class AddMessageRequest(BaseModel):
     tenant_id: str
     user_name: str = ""
     agent_id: str | None = None
+
 
 _cuid = cuid_wrapper()
 _utcnow = lambda: datetime.now(UTC)  # noqa: E731
@@ -64,7 +66,7 @@ class Thread(Resource):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
-    messages: Mapped[list[Message]] = relationship(
+    messages: Mapped[List[Message]] = relationship(
         "Message",
         cascade="all, delete-orphan",
         order_by="Message.position",
@@ -130,7 +132,11 @@ class Thread(Resource):
             run_id = _cuid()
             if not agent_id:
                 channel_ids = resolve_channels_for_thread(self.id, self.tenant_id)
-                agent_id = resolve_agent_for_channel(channel_ids[0], self.tenant_id) if channel_ids else "stub"
+                agent_id = (
+                    resolve_agent_for_channel(channel_ids[0], self.tenant_id)
+                    if channel_ids
+                    else "stub"
+                )
             action_ctx.send_workflow(
                 service="AgentRun",
                 key=run_id,
@@ -151,6 +157,7 @@ class Thread(Resource):
         _role = role
         _content = content
         for _channel_id in resolve_channels_for_thread(self.id, self.tenant_id):
+
             def _deliver_arg(result: dict, cid: str = _channel_id) -> dict:
                 return {
                     "thread_id": _thread_id,
@@ -184,7 +191,9 @@ class Thread(Resource):
                 MessageView(
                     id=m.id,
                     participant_id=m.participant_id,
-                    participant_type=m.participant_type.value if hasattr(m.participant_type, "value") else m.participant_type,
+                    participant_type=m.participant_type.value
+                    if hasattr(m.participant_type, "value")
+                    else m.participant_type,
                     role=m.role.value if hasattr(m.role, "value") else m.role,
                     content=m.content,
                     position=m.position,
@@ -198,6 +207,7 @@ class Thread(Resource):
         # Use the session already open by the framework — no second connection.
         # RLS is already set on this session via tenant_session() in the handler.
         from ironbridge.shared.derive.repository import SqlAlchemyRepository
+
         repo = SqlAlchemyRepository(action_ctx.session, Thread)
         threads = sorted(repo.list(), key=lambda t: t.created_at or datetime.min, reverse=True)
         return ThreadListResult(
@@ -212,7 +222,7 @@ class Thread(Resource):
         )
 
     @action(kind=ActionKind.READ)
-    def get_messages(self, limit: int = 200) -> list[dict]:
+    def get_messages(self, limit: int = 200) -> List[MessageView]:
         """
         Return thread messages visible to the LLM — control parts excluded.
         Returns the most recent `limit` messages, ordered by position ascending.
@@ -226,14 +236,18 @@ class Thread(Resource):
             parts = content.get("parts", [])
             if any(p.get("type") in ("response_reply", "event") for p in parts):
                 continue
-            result.append({
-                "id": m.id,
-                "participant_id": m.participant_id,
-                "participant_type": m.participant_type.value if hasattr(m.participant_type, "value") else m.participant_type,
-                "role": m.role.value if hasattr(m.role, "value") else m.role,
-                "content": content,
-                "position": m.position,
-            })
+            result.append(
+                MessageView(
+                    id=m.id,
+                    participant_id=m.participant_id,
+                    participant_type=m.participant_type.value
+                    if hasattr(m.participant_type, "value")
+                    else m.participant_type,
+                    role=m.role.value if hasattr(m.role, "value") else m.role,
+                    content=content,
+                    position=m.position,
+                )
+            )
         return result
 
     @action(kind=ActionKind.READ)
@@ -243,13 +257,13 @@ class Thread(Resource):
         Returns the run_id extracted from the participant_id of the response_request
         message, or None if not found.
         """
-        for m in (self.messages or []):
+        for m in self.messages or []:
             content = m.content if isinstance(m.content, dict) else {}
             for part in content.get("parts", []):
                 if part.get("type") == "response_request" and part.get("request_id") == request_id:
                     pid = m.participant_id or ""
                     if pid.startswith("agent-run-"):
-                        return pid[len("agent-run-"):]
+                        return pid[len("agent-run-") :]
         return None
 
     @action(kind=ActionKind.STREAM)
@@ -259,10 +273,14 @@ class Thread(Resource):
 
 # ── Domain helpers — pure DB reads, no Restate ────────────────────────────────
 
-def _find_run_id_for_request(thread_id: str, request_id: str | None, tenant_id: str | None) -> str | None:
+
+def _find_run_id_for_request(
+    thread_id: str, request_id: str | None, tenant_id: str | None
+) -> str | None:
     if not request_id or not tenant_id:
         return None
     from ironbridge.shared.derive.repository import SqlAlchemyRepository
+
     with tenant_session(tenant_id) as db:
         repo = SqlAlchemyRepository(db, Thread)
         instance = repo.find_by_id(thread_id)

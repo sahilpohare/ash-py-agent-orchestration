@@ -15,7 +15,19 @@ import pytest
 from ironbridge.platform.agents.agent_run import AgentRunRequest
 from ironbridge.platform.agents.context import AgentCancelledError, AgentContext, _fetch_thread
 from ironbridge.platform.agents.registry import AgentRegistry
+from ironbridge.platform.sessions.thread import MessageView
 from ironbridge.agents.stub import StubAgent, _call_llm, _execute_tool
+
+
+def make_message(role: str, text: str) -> MessageView:
+    return MessageView(
+        id="msg-1",
+        participant_id="user-1",
+        participant_type="HUMAN",
+        role=role,
+        content={"parts": [{"type": "text", "text": text}]},
+        position=1,
+    )
 
 
 # ── _call_llm ─────────────────────────────────────────────────────────────────
@@ -25,7 +37,7 @@ def test_call_llm_returns_none_on_empty_history():
 
 
 def test_call_llm_echoes_user_message():
-    history = [{"role": "USER", "content": {"parts": [{"type": "text", "text": "hello"}]}}]
+    history = [make_message("USER", "hello")]
     result = _call_llm(history)
     assert result is not None
     assert "hello" in result["content"]
@@ -33,7 +45,7 @@ def test_call_llm_echoes_user_message():
 
 
 def test_call_llm_triggers_write_file_tool():
-    history = [{"role": "USER", "content": {"parts": [{"type": "text", "text": "please write this"}]}}]
+    history = [make_message("USER", "please write this")]
     result = _call_llm(history)
     assert result is not None
     assert result["done"] is True
@@ -42,7 +54,7 @@ def test_call_llm_triggers_write_file_tool():
 
 
 def test_call_llm_returns_done_on_non_user_last_message():
-    history = [{"role": "ASSISTANT", "content": {"parts": [{"type": "text", "text": "I did it"}]}}]
+    history = [make_message("ASSISTANT", "I did it")]
     result = _call_llm(history)
     assert result["done"] is True
     assert result["content"] == ""

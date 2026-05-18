@@ -7,15 +7,16 @@ from ironbridge.platform.agents.agent import Agent, AgentStatus
 
 def make_agent() -> Agent:
     a = Agent()
+    a.id = "test-agent-id"  # framework sets id = ctx.key() before calling create()
     a.create(name="Researcher", model="gpt-4o")
     return a
 
 
-def test_create_assigns_id():
+def test_create_preserves_framework_id():
     a = Agent()
+    a.id = "framework-set-id"
     result = a.create(name="Researcher", model="gpt-4o")
-    assert result.id
-    assert len(result.id) > 0
+    assert result.id == "framework-set-id"
 
 
 def test_create_returns_self():

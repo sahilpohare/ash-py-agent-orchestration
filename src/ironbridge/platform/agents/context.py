@@ -21,6 +21,7 @@ from restate.exceptions import RetryableError, TerminalError
 
 from ironbridge.platform.agents.agent_run import AgentRunRequest
 from ironbridge.platform.agents.hitl import HITL, HumanResponse, _call_add_message
+from ironbridge.platform.sessions.thread import MessageView
 from ironbridge.shared.db import tenant_session
 
 # HTTP status codes that are permanent — no point retrying
@@ -91,7 +92,7 @@ class AgentContext:
         """
         return await self._ctx.run(name, fn)
 
-    def get_history(self, limit: int = 200) -> list[dict]:
+    def get_history(self, limit: int = 200) -> list[MessageView]:
         """
         Fetch thread message history from DB.
         Sync — designed to be called inside step() or run():
@@ -192,7 +193,7 @@ class AgentContext:
 # ── Internal DB helpers ────────────────────────────────────────────────────────
 
 
-def _fetch_thread(thread_id: str, tenant_id: str, limit: int = 200) -> list[dict]:
+def _fetch_thread(thread_id: str, tenant_id: str, limit: int = 200) -> list[MessageView]:
     """
     Fetch thread message history via Thread.get_messages domain action.
     Filters control messages (response_reply, event) — not visible to LLM.
