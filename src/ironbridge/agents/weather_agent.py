@@ -39,11 +39,17 @@ _TOOLS = [
 
 
 def _llm_call(messages: list, tools=None) -> dict:
-    client = OpenAI(
-        api_key=os.environ.get("CEREBRAS_API_KEY", ""),
-        base_url="https://api.cerebras.ai/v1",
-    )
-    kwargs = {"model": "llama3.1-8b", "messages": messages}
+    api_key = os.environ.get("LLM_API_KEY") or os.environ.get("CEREBRAS_API_KEY", "")
+    base_url = os.environ.get("LLM_BASE_URL") or "https://api.cerebras.ai/v1"
+    model = os.environ.get("LLM_MODEL", "llama3.1-8b")
+    # Strip LiteLLM provider prefix — OpenAI client uses bare model name with base_url
+    if model.startswith("openrouter/"):
+        model = model[len("openrouter/"):]
+        base_url = "https://openrouter.ai/api/v1"
+    elif "/" in model and not model.startswith("http"):
+        model = model.split("/", 1)[-1]
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    kwargs = {"model": model, "messages": messages}
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"

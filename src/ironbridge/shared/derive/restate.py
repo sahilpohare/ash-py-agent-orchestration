@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 from datetime import datetime
 from typing import Any
 
@@ -33,7 +34,7 @@ from ironbridge.platform.identity.auth import extract_auth
 from ironbridge.shared.db import tenant_session
 from ironbridge.shared.derive.repository import SqlAlchemyRepository
 from ironbridge.shared.framework.actions import ActionKind
-from ironbridge.shared.framework.effects import ActionContext, SendEffect, WorkflowEffect
+from ironbridge.shared.framework.effects import ActionContext, DeferredSendEffect, SendEffect, WorkflowEffect
 from ironbridge.shared.framework.resource import Resource
 
 _object_cache: dict[str, restate.VirtualObject] = {}
@@ -76,11 +77,28 @@ def _attach_queue_handlers(obj: restate.VirtualObject, resource_name: str) -> No
     _rp = restate.InvocationRetryPolicy(max_attempts=3)
 
     async def _enqueue_run(ctx: Any, req: dict | None) -> None:
+        import httpx as _httpx
         from ironbridge.platform.agents.agent_run import AgentRunRequest
         from ironbridge.shared.derive.restate_workflow import WORKFLOW_HANDLERS
 
         req = req or {}
         active = await ctx.get("active_run_id")
+
+        if active is not None:
+            restate_url = os.environ.get("RESTATE_URL", "http://restate:8080")
+
+            def _check_status():
+                try:
+                    r = _httpx.get(f"{restate_url}/AgentRun/{active}/status", timeout=5)
+                    return r.json() if r.status_code == 200 else None
+                except Exception:
+                    return None
+
+            status = await ctx.run("check_active_run_status", _check_status)
+            if status != "running":
+                ctx.set("active_run_id", None)
+                ctx.set("pending_runs", [])
+                active = None
 
         if active is None:
             # No active run — fire immediately
@@ -262,6 +280,15 @@ def _execute_effects(ctx: Any, effects: list, result: Any, resource_name: str = 
             handler_fn, input_model = entry
             arg = input_model(**effect.arg) if input_model and isinstance(effect.arg, dict) else effect.arg
             ctx.workflow_send(handler_fn, key=effect.key, arg=arg)
+        elif isinstance(effect, DeferredSendEffect):
+            arg = effect.factory(result)
+            kwargs = {"key": effect.key} if effect.key is not None else {}
+            ctx.generic_send(
+                effect.service,
+                effect.handler,
+                json.dumps(arg).encode(),
+                **kwargs,
+            )
         elif isinstance(effect, SendEffect):
             kwargs = {"key": effect.key} if effect.key is not None else {}
             ctx.generic_send(

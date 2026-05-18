@@ -25,6 +25,7 @@ Crash recovery:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import restate
@@ -40,8 +41,8 @@ from ironbridge.platform.agents.agent_run import (
 )
 from ironbridge.platform.agents.agent_run_event import AgentRunEvent
 from ironbridge.platform.agents.context import AgentCancelledError, AgentContext
-from ironbridge.platform.agents.hitl import _call_add_message
 from ironbridge.platform.agents.registry import agent_registry
+from ironbridge.platform.sessions.thread import AddMessageRequest
 from ironbridge.shared.db import tenant_session
 from ironbridge.shared.derive.repository import SqlAlchemyRepository
 
@@ -92,16 +93,19 @@ async def run(ctx: WorkflowContext, req: AgentRunRequest) -> AgentRunResult:
             "mark_failed",
             lambda: _write_run_event(req.thread_id, req.run_id, req.tenant_id, "FAILED"),
         )
-        _call_add_message(
-            thread_id=req.thread_id,
-            run_id=req.run_id,
-            tenant_id=req.tenant_id,
-            content={
-                "version": 1,
-                "parts": [{"type": "event", "event": "AGENT_RUN_FAILED", "error": err_msg}],
-            },
-            idempotency_key=f"{req.run_id}:failed",
-            role="SYSTEM",
+        ctx.generic_send(
+            "Thread",
+            "add_message",
+            AddMessageRequest(
+                participant_id=f"agent-run-{req.run_id}",
+                participant_type="AGENT",
+                role="SYSTEM",
+                content={"version": 1, "parts": [{"type": "event", "event": "AGENT_RUN_FAILED", "error": err_msg}]},
+                idempotency_key=f"{req.run_id}:failed",
+                tenant_id=req.tenant_id,
+                user_name=f"agent-run-{req.run_id}",
+            ).model_dump_json().encode(),
+            key=req.thread_id,
         )
         ctx.generic_send("Thread", "_run_done", b"{}", key=req.thread_id)
         return AgentRunResult(
@@ -144,7 +148,20 @@ async def resolve_hitl(ctx: WorkflowContext, req: ResolveHITLRequest) -> None:
             f"write_orphaned_event:{req.request_id}",
             lambda: _write_run_event(req.thread_id, ctx.key(), req.tenant_id, "FAILED"),
         )
-        _write_orphaned_message(req.thread_id, ctx.key(), req.tenant_id, req.request_id)
+        ctx.generic_send(
+            "Thread",
+            "add_message",
+            AddMessageRequest(
+                participant_id=f"agent-run-{ctx.key()}",
+                participant_type="AGENT",
+                role="SYSTEM",
+                content={"version": 1, "parts": [{"type": "event", "event": "AGENT_RUN_ORPHANED", "request_id": req.request_id}]},
+                idempotency_key=f"{ctx.key()}:orphaned:{req.request_id}",
+                tenant_id=req.tenant_id,
+                user_name=f"agent-run-{ctx.key()}",
+            ).model_dump_json().encode(),
+            key=req.thread_id,
+        )
         return
     await ctx.promise(f"hitl:{req.request_id}").resolve(
         {"selected": req.selected, "submitted_by": req.submitted_by}
@@ -191,15 +208,3 @@ def _write_run_event(thread_id: str, run_id: str, tenant_id: str, event_type: st
         db.commit()
 
 
-def _write_orphaned_message(thread_id: str, run_id: str, tenant_id: str, request_id: str) -> None:
-    _call_add_message(
-        thread_id=thread_id,
-        run_id=run_id,
-        tenant_id=tenant_id,
-        content={
-            "version": 1,
-            "parts": [{"type": "event", "event": "AGENT_RUN_ORPHANED", "request_id": request_id}],
-        },
-        idempotency_key=f"{run_id}:orphaned:{request_id}",
-        role="SYSTEM",
-    )

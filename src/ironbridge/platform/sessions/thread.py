@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime
 
 from cuid2 import cuid_wrapper
+from pydantic import BaseModel
 from sqlalchemy import DateTime, String, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -10,6 +11,17 @@ from ironbridge.platform.channels.channel_binding import resolve_channel_for_thr
 from ironbridge.platform.sessions.message import Message, MessageRole, ParticipantType
 from ironbridge.shared.db import tenant_session
 from ironbridge.shared.framework import ActionContext, ActionKind, Resource, action
+
+
+class AddMessageRequest(BaseModel):
+    participant_id: str
+    participant_type: str
+    role: str
+    content: dict
+    idempotency_key: str
+    tenant_id: str
+    user_name: str = ""
+    agent_id: str | None = None
 
 _cuid = cuid_wrapper()
 _utcnow = lambda: datetime.now(UTC)  # noqa: E731
@@ -105,31 +117,59 @@ class Thread(Resource):
                 },
             )
 
-        # Route all messages to channel for adapters to filter
+        # Route all messages to channel for adapters to filter.
+        # send_after defers arg construction until after position is assigned.
         channel_id = resolve_channel_for_thread(self.id, self.tenant_id)
         if channel_id:
-            action_ctx.send(
+            _channel_id = channel_id
+            _thread_id = self.id
+            _tenant_id = self.tenant_id
+            _participant_id = participant_id
+            _participant_type = participant_type
+            _role = role
+            _content = content
+
+            def _deliver_arg(result: dict) -> dict:
+                return {
+                    "thread_id": _thread_id,
+                    "channel_id": _channel_id,
+                    "tenant_id": _tenant_id,
+                    "message": {
+                        "participant_id": _participant_id,
+                        "participant_type": _participant_type,
+                        "role": _role,
+                        "content": _content,
+                        "position": result.get("position"),
+                    },
+                }
+
+            action_ctx.send_after(
                 service="ChannelDelivery",
                 handler="deliver",
                 key=None,
-                arg={
-                    "thread_id": self.id,
-                    "channel_id": channel_id,
-                    "tenant_id": self.tenant_id,
-                    "message": {
-                        "participant_id": participant_id,
-                        "participant_type": participant_type,
-                        "role": role,
-                        "content": content,
-                    },
-                },
+                factory=_deliver_arg,
             )
 
         return msg
 
     @action(kind=ActionKind.READ)
-    def get(self) -> "Thread":
-        return self
+    def get(self) -> dict:
+        return {
+            "id": self.id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "messages": [
+                {
+                    "id": m.id,
+                    "participant_id": m.participant_id,
+                    "participant_type": m.participant_type.value if hasattr(m.participant_type, "value") else m.participant_type,
+                    "role": m.role.value if hasattr(m.role, "value") else m.role,
+                    "content": m.content,
+                    "position": m.position,
+                }
+                for m in (self.messages or [])
+            ],
+        }
 
     @action(kind=ActionKind.STREAM)
     def observe(self) -> "Thread":

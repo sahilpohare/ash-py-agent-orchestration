@@ -24,7 +24,7 @@ Usage in a domain action:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass
@@ -34,6 +34,15 @@ class SendEffect:
     handler: str
     key: str | None
     arg: Any
+
+
+@dataclass
+class DeferredSendEffect:
+    """Like SendEffect but arg is built from the action result after the DB write."""
+    service: str
+    handler: str
+    key: str | None
+    factory: Callable[[Any], Any]
 
 
 @dataclass
@@ -52,16 +61,20 @@ class ActionContext:
     """
 
     def __init__(self) -> None:
-        self._effects: list[SendEffect | WorkflowEffect] = []
+        self._effects: list[SendEffect | DeferredSendEffect | WorkflowEffect] = []
 
     def send(self, service: str, handler: str, key: str, arg: Any) -> None:
         """Enqueue a fire-and-forget send to a VirtualObject handler."""
         self._effects.append(SendEffect(service=service, handler=handler, key=key, arg=arg))
+
+    def send_after(self, service: str, handler: str, key: str | None, factory: Callable[[Any], Any]) -> None:
+        """Enqueue a send whose arg is produced by factory(result) after the action completes."""
+        self._effects.append(DeferredSendEffect(service=service, handler=handler, key=key, factory=factory))
 
     def send_workflow(self, service: str, key: str, arg: Any, handler: str = "run") -> None:
         """Enqueue a workflow start or signal."""
         self._effects.append(WorkflowEffect(service=service, handler=handler, key=key, arg=arg))
 
     @property
-    def effects(self) -> list[SendEffect | WorkflowEffect]:
+    def effects(self) -> list[SendEffect | DeferredSendEffect | WorkflowEffect]:
         return list(self._effects)

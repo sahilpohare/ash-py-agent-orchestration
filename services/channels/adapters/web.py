@@ -71,6 +71,7 @@ class WebAdapter(BaseChannelAdapter):
             "participant_type": message.participant_type,
             "role": message.role,
             "content": {"version": 1, "parts": [p.model_dump() for p in message.parts]},
+            "position": message.position,
         }
         try:
             pusher_channel = f"thread-{message.thread_id}"

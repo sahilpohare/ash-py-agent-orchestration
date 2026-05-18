@@ -13,6 +13,7 @@ Registered as "streaming_weather".
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from collections.abc import Callable
@@ -20,9 +21,11 @@ from collections.abc import Callable
 import httpx
 from crewai import LLM, Agent, Crew, Task
 from crewai.events.event_bus import crewai_event_bus
-from crewai.events.types.llm_events import LLMStreamChunkEvent
+from crewai.events.types.llm_events import LLMCallCompletedEvent, LLMStreamChunkEvent
 from crewai.tools import BaseTool
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 from ironbridge.platform.agents.base import BaseAgent
 from ironbridge.platform.agents.context import AgentContext
@@ -67,15 +70,21 @@ def _run_crew_streaming(
     on_chunk is called for each LLM token chunk as it arrives.
     Returns the final accumulated response string.
     """
-    llm = LLM(
-        model="cerebras/gpt-oss-120b",
-        api_key=os.environ.get("CEREBRAS_API_KEY", ""),
-        stream=True,
-    )
+    llm_kwargs: dict = {
+        "model": os.environ.get("LLM_MODEL", "cerebras/qwen-3-235b-a22b-instruct-2507"),
+        "api_key": os.environ.get("LLM_API_KEY") or os.environ.get("CEREBRAS_API_KEY", ""),
+        "stream": True,
+    }
+    if base_url := os.environ.get("LLM_BASE_URL"):
+        llm_kwargs["base_url"] = base_url
+    llm = LLM(**llm_kwargs)
 
-    # Track chunks to avoid emitting tool-call fragments as text
     _lock = threading.Lock()
     _accumulated: list[str] = []
+
+    @crewai_event_bus.on(LLMCallCompletedEvent)
+    def _on_llm_complete(source: object, event: LLMCallCompletedEvent) -> None:
+        logger.info("LLM response: %s", event.response)
 
     @crewai_event_bus.on(LLMStreamChunkEvent)
     def _on_chunk(source: object, event: LLMStreamChunkEvent) -> None:
@@ -87,10 +96,11 @@ def _run_crew_streaming(
         on_chunk(chunk)
 
     try:
+        no_think = "/no_think\n" if os.environ.get("LLM_BASE_URL") else ""
         agent = Agent(
             role="Weather Assistant",
             goal="Answer weather questions accurately using the get_weather tool.",
-            backstory="You are a helpful assistant that provides current weather information.",
+            backstory=f"{no_think}You are a helpful assistant that provides current weather information.",
             llm=llm,
             tools=[GetWeatherTool()],
             verbose=False,
@@ -105,6 +115,7 @@ def _run_crew_streaming(
         return str(result)
     finally:
         crewai_event_bus.off(LLMStreamChunkEvent, _on_chunk)
+        crewai_event_bus.off(LLMCallCompletedEvent, _on_llm_complete)
 
 
 # ── Agent ───────────────────────────────────────────────────────────────────────

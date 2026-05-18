@@ -8,11 +8,25 @@ Parts are discriminated unions — adapters pattern-match on type.
 from __future__ import annotations
 
 import logging
+from enum import StrEnum
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+
+class ParticipantType(StrEnum):
+    HUMAN = "HUMAN"
+    AGENT = "AGENT"
+    SYSTEM = "SYSTEM"
+
+
+class MessageRole(StrEnum):
+    USER = "USER"
+    ASSISTANT = "ASSISTANT"
+    SYSTEM = "SYSTEM"
+
 
 _KNOWN_PART_TYPES = {
     "text", "text_delta", "stream_end", "event",
@@ -81,9 +95,10 @@ Part = Annotated[
 class ChannelMessage(BaseModel):
     thread_id: str
     participant_id: str
-    participant_type: str   # HUMAN | AGENT | SYSTEM
-    role: str               # USER | ASSISTANT | SYSTEM
+    participant_type: ParticipantType
+    role: MessageRole
     parts: list[Part] = Field(default_factory=list)
+    position: int | None = None
 
     @classmethod
     def from_dict(cls, message: dict) -> ChannelMessage:
@@ -102,9 +117,10 @@ class ChannelMessage(BaseModel):
         return cls(
             thread_id=message.get("thread_id", ""),
             participant_id=message.get("participant_id", ""),
-            participant_type=message.get("participant_type", ""),
-            role=message.get("role", ""),
+            participant_type=ParticipantType(message.get("participant_type", "SYSTEM")),
+            role=MessageRole(message.get("role", "SYSTEM")),
             parts=parsed_parts,
+            position=message.get("position"),
         )
 
 

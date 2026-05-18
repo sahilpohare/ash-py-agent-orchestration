@@ -19,7 +19,7 @@ services:
   restate:
     image: docker.restate.dev/restatedev/restate:latest
     ports:
-      - "8080:8080"   # ingress — clients call here
+      - "8082:8080"   # ingress — clients call here
       - "9070:9070"   # admin UI + registration
     environment:
       RESTATE_LOG_FILTER: "restate=info"
@@ -52,6 +52,10 @@ services:
       PUSHER_SECRET: "${PUSHER_SECRET}"
       PUSHER_CLUSTER: "${PUSHER_CLUSTER:-eu}"
       CEREBRAS_API_KEY: "${CEREBRAS_API_KEY}"
+      LLM_MODEL: "${LLM_MODEL:-cerebras/qwen-3-235b-a22b-instruct-2507}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-}"
+      OPENROUTER_API_KEY: "${LLM_API_KEY:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -62,10 +66,11 @@ services:
         DATABASE_URL=$$ALEMBIC_URL alembic upgrade head &&
         python -m hypercorn ironbridge.main:app --bind 0.0.0.0:9080 &
         until curl -sf http://localhost:9080/discover > /dev/null 2>&1; do sleep 1; done &&
-        curl -sf --retry 5 --retry-delay 2
-          http://restate:9070/deployments
-          -H 'content-type: application/json'
-          -d '{\"uri\": \"http://app:9080\", \"force\": true}' &&
+        until curl -sf -X POST http://restate:9070/deployments \
+          -H 'content-type: application/json' \
+          -d '{\"uri\": \"http://app:9080\", \"force\": true}' > /dev/null 2>&1; do
+          echo 'Waiting for Restate to accept deployment...' && sleep 2;
+        done &&
         wait
       "
 

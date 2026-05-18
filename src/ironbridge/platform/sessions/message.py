@@ -33,6 +33,8 @@ class Message(Resource):
     class Meta:
         tenant_scoped = True
         restate_object = False
+        conflict_columns = ("thread_id", "idempotency_key")
+        conflict_action = "nothing"
 
     __tablename__ = "messages"
     __table_args__ = (

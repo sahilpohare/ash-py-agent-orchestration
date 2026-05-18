@@ -240,7 +240,10 @@ def test_add_message_ids_are_unique():
 
 def test_get_returns_self():
     t = make_thread()
-    assert t.get() is t
+    result = t.get()
+    assert isinstance(result, dict)
+    assert result["id"] == t.id
+    assert "messages" in result
 
 
 # ── Action metadata ───────────────────────────────────────────────────────────

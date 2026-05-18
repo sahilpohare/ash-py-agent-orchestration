@@ -80,7 +80,16 @@ class SqlAlchemyRepository[R: Resource]:
                         text(f"SELECT current_setting('app.{col}', true)")
                     ).scalar()
 
-        if self._idempotent:
+        conflict_cols = meta.get("conflict_columns")
+        conflict_action = meta.get("conflict_action", "update")
+
+        if conflict_cols and conflict_action == "nothing":
+            stmt = (
+                pg_insert(type(instance))
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=list(conflict_cols))
+            )
+        elif self._idempotent:
             values[_IDEMPOTENCY_COL] = _content_key(values, self._pk)
             stmt = (
                 pg_insert(type(instance))

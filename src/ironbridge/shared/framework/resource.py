@@ -52,7 +52,8 @@ class ResourceMeta(type(Base)):
             "tenancy_key": ("tenant_id",),  # always a tuple internally
         }
         if raw_meta:
-            for key in ("tenant_scoped", "restate_object", "idempotent", "terminal_errors"):
+            for key in ("tenant_scoped", "restate_object", "idempotent", "terminal_errors",
+                        "conflict_columns", "conflict_action"):
                 if hasattr(raw_meta, key):
                     meta[key] = getattr(raw_meta, key)
             if hasattr(raw_meta, "tenancy_key"):
