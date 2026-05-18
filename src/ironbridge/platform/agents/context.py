@@ -11,11 +11,15 @@ WorkflowContext. Agents are unaware of Restate internals.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import time
+import typing
 from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
+
+from pydantic import BaseModel
 
 from restate.exceptions import RetryableError, TerminalError
 
@@ -66,13 +70,24 @@ class AgentContext:
 
         Permanent errors (HTTP 4xx) are wrapped as TerminalError so Restate
         stops retrying immediately and the workflow surfaces AGENT_RUN_FAILED.
+
+        Pydantic transparency: Restate journals JSON only. Pydantic models
+        returned from fn are serialized to dicts before journaling, then
+        reconstructed from fn's return type annotation after.
         """
         if await self.is_cancelled():
             raise AgentCancelledError()
 
+        ret_hint = inspect.get_annotations(fn, eval_str=True).get("return")
+
         def _guarded():
             try:
-                return fn()
+                result = fn()
+                if isinstance(result, BaseModel):
+                    return result.model_dump(mode="json")
+                if isinstance(result, list) and result and isinstance(result[0], BaseModel):
+                    return [item.model_dump(mode="json") for item in result]
+                return result
             except Exception as e:
                 status = getattr(e, "status_code", None)
                 if status in _TERMINAL_STATUS_CODES:
@@ -80,10 +95,21 @@ class AgentContext:
                 raise
 
         try:
-            return await self._ctx.run(name, _guarded)
+            result = await self._ctx.run(name, _guarded)
         except RetryableError as e:
             _write_retry_event(self.thread_id, self.run_id, self.tenant_id, name, str(e))
             raise
+
+        # Reconstruct Pydantic models from journaled dicts using return type hint
+        origin = typing.get_origin(ret_hint)
+        args = typing.get_args(ret_hint)
+        if origin is list and args and isinstance(result, list):
+            item_cls = args[0]
+            if isinstance(item_cls, type) and issubclass(item_cls, BaseModel):
+                return [item_cls(**m) if isinstance(m, dict) else m for m in result]
+        if isinstance(ret_hint, type) and issubclass(ret_hint, BaseModel) and isinstance(result, dict):
+            return ret_hint(**result)
+        return result
 
     async def run(self, name: str, fn: Callable) -> Any:
         """

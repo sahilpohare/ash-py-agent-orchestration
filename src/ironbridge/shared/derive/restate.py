@@ -304,7 +304,7 @@ def _execute_effects(ctx: Any, effects: list, result: Any, resource_name: str = 
 def _serialize(obj: Any) -> Any:
     from pydantic import BaseModel
     if isinstance(obj, BaseModel):
-        return obj.model_dump()
+        return obj.model_dump(mode="json")
     if isinstance(obj, list):
         return [_serialize(item) for item in obj]
     if isinstance(obj, Resource):
