@@ -77,7 +77,6 @@ def _attach_queue_handlers(obj: restate.VirtualObject, resource_name: str) -> No
     _rp = restate.InvocationRetryPolicy(max_attempts=3)
 
     async def _enqueue_run(ctx: Any, req: dict | None) -> None:
-        import httpx as _httpx
         from ironbridge.platform.agents.agent_run import AgentRunRequest
         from ironbridge.shared.derive.restate_workflow import WORKFLOW_HANDLERS
 
@@ -85,17 +84,18 @@ def _attach_queue_handlers(obj: restate.VirtualObject, resource_name: str) -> No
         active = await ctx.get("active_run_id")
 
         if active is not None:
-            restate_url = os.environ.get("RESTATE_URL", "http://restate:8080")
+            cancel_fn, _ = WORKFLOW_HANDLERS[("AgentRun", "cancel")]
+            status_fn, _ = WORKFLOW_HANDLERS[("AgentRun", "status")]
 
-            def _check_status():
-                try:
-                    r = _httpx.get(f"{restate_url}/AgentRun/{active}/status", timeout=5)
-                    return r.json() if r.status_code == 200 else None
-                except Exception:
-                    return None
-
-            status = await ctx.run("check_active_run_status", _check_status)
+            status = await ctx.workflow_call(status_fn, key=active, arg=None)
             if status != "running":
+                ctx.set("active_run_id", None)
+                ctx.set("pending_runs", [])
+                active = None
+            else:
+                # Active run is running (possibly suspended on HITL) — cancel it
+                # and drain the queue so the new message starts immediately.
+                ctx.workflow_send(cancel_fn, key=active, arg=None)
                 ctx.set("active_run_id", None)
                 ctx.set("pending_runs", [])
                 active = None

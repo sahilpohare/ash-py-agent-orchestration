@@ -103,19 +103,50 @@ class WeatherAgent(BaseAgent):
                 )
             return
 
-        # Step 2: Gate each tool call with HITL approval
+        # Step 2: Resolve each location — clarify if ambiguous, then fetch
         tool_results = []
         for i, tc in enumerate(tool_calls):
-            location = tc["arguments"].get("location", "")
-            approval = await ctx.request_approval(
-                prompt=f"Fetch weather for {location!r}?",
-                created_by=f"agent-run-{ctx.run_id}",
-                options=[{"id": "approve", "label": "Allow"}, {"id": "deny", "label": "Deny"}],
-                context={"location": location},
+            raw_location = tc["arguments"].get("location", "")
+
+            # Ask LLM: is this location ambiguous? If so, produce options.
+            clarify = await ctx.step(
+                f"clarify_{i}_{raw_location}",
+                lambda loc=raw_location: _llm_call([
+                    {"role": "system", "content": (
+                        "You are a location disambiguation assistant. "
+                        "Given a location string, decide if it is ambiguous or unclear. "
+                        "If it is clear and unambiguous, respond with JSON: {\"ambiguous\": false, \"resolved\": \"<location>\"}. "
+                        "If it is ambiguous, respond with JSON: {\"ambiguous\": true, \"prompt\": \"<question to ask user>\", "
+                        "\"options\": [{\"id\": \"<canonical name>\", \"label\": \"<display label>\"}, ...]}. "
+                        "Always respond with valid JSON only, no extra text."
+                    )},
+                    {"role": "user", "content": loc},
+                ]),
             )
-            if not approval.approved:
-                tool_results.append({"id": tc["id"], "name": tc["name"], "result": f"Denied for {location}."})
-                continue
+
+            try:
+                clarify_data = json.loads(clarify.get("content", "{}"))
+            except (json.JSONDecodeError, AttributeError):
+                clarify_data = {"ambiguous": False, "resolved": raw_location}
+
+            if clarify_data.get("ambiguous"):
+                response = await ctx.request_approval(
+                    prompt=clarify_data.get("prompt", f"Which '{raw_location}' did you mean?"),
+                    created_by=f"agent-run-{ctx.run_id}",
+                    options=clarify_data.get("options", [
+                        {"id": raw_location, "label": raw_location},
+                        {"id": "cancel", "label": "Cancel"},
+                    ]),
+                    context={"raw_location": raw_location},
+                )
+                selected = response.selected[0] if response.selected else "cancel"
+                if response.timed_out or selected == "cancel":
+                    tool_results.append({"id": tc["id"], "name": tc["name"], "result": f"Cancelled for {raw_location}."})
+                    continue
+                location = selected
+            else:
+                location = clarify_data.get("resolved", raw_location)
+
             result = await ctx.step(
                 f"get_weather_{i}_{location}",
                 lambda loc=location: _fetch_weather(loc),

@@ -42,7 +42,37 @@ class StubAgent(BaseAgent):
 
             # Write intro text first, durably, before any HITL cards
             text = response.get("content", "")
-            if text:
+            if text == "__MULTI_CHOICE__":
+                # Demo: multi-option HITL card — ask user to pick one of several options
+                choice = await ctx.request_approval(
+                    prompt="Which option would you like?",
+                    created_by=f"agent-run-{ctx.run_id}",
+                    options=[
+                        {"id": "option_a", "label": "Option A — Run summary report"},
+                        {"id": "option_b", "label": "Option B — Export to CSV"},
+                        {"id": "option_c", "label": "Option C — Send email digest"},
+                        {"id": "cancel",   "label": "Cancel"},
+                    ],
+                    context={"demo": "multi_choice"},
+                    timeout=timedelta(hours=24),
+                )
+                selected = choice.selected[0] if choice.selected else "cancel"
+                if choice.timed_out or selected == "cancel":
+                    reply = "Cancelled — no option selected."
+                else:
+                    labels = {
+                        "option_a": "Running summary report…",
+                        "option_b": "Exporting to CSV…",
+                        "option_c": "Sending email digest…",
+                    }
+                    reply = labels.get(selected, f"Selected: {selected}")
+                ctx.write_message(
+                    {"version": 1, "parts": [{"type": "text", "text": reply}]},
+                    message_count,
+                )
+                message_count += 1
+                break
+            elif text:
                 await ctx.run(
                     f"write_intro_{message_count}",
                     lambda t=text, mc=message_count: _write_message_sync(ctx, t, mc),
@@ -125,6 +155,13 @@ def _call_llm(history: list) -> dict | None:
         return {"content": "", "tool_calls": [], "done": True, "raw": None}
     parts = last.get("content", {}).get("parts", [])
     text = next((p.get("text", "") for p in parts if p.get("type") == "text"), "")
+    if "choose" in text.lower() or "pick" in text.lower() or "options" in text.lower():
+        return {
+            "content": "__MULTI_CHOICE__",
+            "tool_calls": [],
+            "done": True,
+            "raw": None,
+        }
     if "parallel" in text.lower():
         return {
             "content": "I'll run 3 tools in parallel — each needs your approval.",
