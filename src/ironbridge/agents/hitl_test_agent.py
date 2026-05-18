@@ -15,7 +15,7 @@ class HITLTestAgent(BaseAgent):
         history = await ctx.step("fetch_history", ctx.get_history)
 
         last_user = next(
-            (m for m in reversed(history) if m.get("role") == "USER"),
+            (m for m in reversed(history) if m.role == "USER"),
             None,
         )
         if not last_user:

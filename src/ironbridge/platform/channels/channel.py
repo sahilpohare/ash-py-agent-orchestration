@@ -1,10 +1,11 @@
 from datetime import UTC, datetime
 
 from cuid2 import cuid_wrapper
-from sqlalchemy import JSON, DateTime, String, text
+from sqlalchemy import JSON, DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ironbridge.shared.db import tenant_session
+from ironbridge.shared.derive.repository import SqlAlchemyRepository
 from ironbridge.shared.framework import ActionKind, Resource, action
 
 _cuid = cuid_wrapper()
@@ -44,7 +45,6 @@ class Channel(Resource):
         default_agent_id: str = "stub",
         config: dict | None = None,
     ) -> "Channel":
-        self.id = _cuid()
         self.name = name
         self.channel_type = channel_type
         self.default_agent_id = default_agent_id
@@ -82,8 +82,6 @@ def resolve_agent_for_channel(channel_id: str, tenant_id: str | None) -> str:
     if not channel_id or not tenant_id:
         return "stub"
     with tenant_session(tenant_id) as db:
-        row = db.execute(
-            text("SELECT default_agent_id FROM channels WHERE id = :cid LIMIT 1"),
-            {"cid": channel_id},
-        ).fetchone()
-    return row[0] if row else "stub"
+        repo = SqlAlchemyRepository(db, Channel)
+        channel = repo.find_by_id(channel_id)
+    return channel.default_agent_id if channel else "stub"

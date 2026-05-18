@@ -10,10 +10,11 @@ No restate_object — pure DB record, written directly in channel inbound handle
 from datetime import UTC, datetime
 
 from cuid2 import cuid_wrapper
-from sqlalchemy import DateTime, String, UniqueConstraint, text
+from sqlalchemy import DateTime, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ironbridge.shared.db import tenant_session
+from ironbridge.shared.derive.repository import SqlAlchemyRepository
 from ironbridge.shared.framework import Resource
 
 _cuid = cuid_wrapper()
@@ -41,8 +42,6 @@ def resolve_channels_for_thread(thread_id: str, tenant_id: str | None) -> list[s
     if not tenant_id:
         return []
     with tenant_session(tenant_id) as db:
-        rows = db.execute(
-            text("SELECT channel_id FROM channel_bindings WHERE thread_id = :tid"),
-            {"tid": thread_id},
-        ).fetchall()
-    return [row[0] for row in rows]
+        repo = SqlAlchemyRepository(db, ChannelBinding)
+        bindings = repo.list(thread_id=thread_id)
+    return [b.channel_id for b in bindings]

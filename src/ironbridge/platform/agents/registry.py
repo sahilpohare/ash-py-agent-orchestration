@@ -43,5 +43,20 @@ class AgentRegistry:
     def all(self) -> dict[str, type[BaseAgent] | str]:
         return dict(self._registry)
 
+    def validate_all(self) -> None:
+        """
+        Assert every registered agent can be instantiated (or is a valid URL).
+        Call at startup to catch missing imports early — fails loud, not at runtime.
+        """
+        for agent_id, entry in self._registry.items():
+            if isinstance(entry, str):
+                if not entry.startswith("http"):
+                    raise ValueError(f"Agent '{agent_id}' has invalid URL: {entry!r}")
+            else:
+                try:
+                    entry()
+                except Exception as exc:
+                    raise RuntimeError(f"Agent '{agent_id}' failed to instantiate: {exc}") from exc
+
 
 agent_registry = AgentRegistry()

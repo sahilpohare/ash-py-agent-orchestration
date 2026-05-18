@@ -58,10 +58,15 @@ class ActionContext:
     """
     Collects effects declared by a domain action.
     Passed in by infrastructure, never imported from Restate.
+
+    session: the SQLAlchemy Session already open for this handler invocation.
+    Actions that need to query beyond self (e.g. list) use this session directly
+    instead of opening a second one.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, session: Any = None) -> None:
         self._effects: list[SendEffect | DeferredSendEffect | WorkflowEffect] = []
+        self.session = session
 
     def send(self, service: str, handler: str, key: str, arg: Any) -> None:
         """Enqueue a fire-and-forget send to a VirtualObject handler."""

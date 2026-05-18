@@ -17,7 +17,6 @@ from datetime import timedelta
 
 from ironbridge.platform.agents.base import BaseAgent
 from ironbridge.platform.agents.context import AgentContext
-from ironbridge.platform.agents.hitl import _call_add_message
 from ironbridge.platform.agents.registry import agent_registry
 
 APPROVAL_REQUIRED = {"write_file", "delete_rows", "read_db", "send_email"}
@@ -73,9 +72,9 @@ class StubAgent(BaseAgent):
                 message_count += 1
                 break
             elif text:
-                await ctx.run(
-                    f"write_intro_{message_count}",
-                    lambda t=text, mc=message_count: _write_message_sync(ctx, t, mc),
+                ctx.write_message(
+                    {"version": 1, "parts": [{"type": "text", "text": text}]},
+                    message_count,
                 )
                 message_count += 1
 
@@ -96,9 +95,9 @@ class StubAgent(BaseAgent):
 
             # Show "processing…" after all approvals before executing
             if needs_approval:
-                await ctx.run(
-                    f"write_processing_{message_count}",
-                    lambda mc=message_count: _write_message_sync(ctx, "Processing…", mc),
+                ctx.write_message(
+                    {"version": 1, "parts": [{"type": "text", "text": "Processing…"}]},
+                    message_count,
                 )
                 message_count += 1
 
@@ -128,21 +127,6 @@ class StubAgent(BaseAgent):
                 f"fetch_history_{message_count}",
                 ctx.get_history,
             )
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _write_message_sync(ctx: AgentContext, text: str, message_count: int) -> None:
-    """Blocking write — called inside ctx.run() so it's journaled before HITL cards."""
-    import hashlib
-    ikey = hashlib.sha256(f"{ctx.run_id}:response:{message_count}".encode()).hexdigest()[:16]
-    _call_add_message(
-        thread_id=ctx.thread_id,
-        run_id=ctx.run_id,
-        tenant_id=ctx.tenant_id,
-        content={"version": 1, "parts": [{"type": "text", "text": text}]},
-        idempotency_key=f"{ctx.run_id}:response:{ikey}",
-    )
 
 
 # ── Stubs — replace with real LLM/tool implementations ────────────────────────

@@ -4,6 +4,8 @@ import — then derives Restate VirtualObjects and Starlette HTTP routes from
 the registry.
 """
 
+import os
+
 import restate
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,8 +32,12 @@ from ironbridge.platform.sessions.thread import Thread  # noqa: F401
 from ironbridge.shared.derive.restate import derive_virtual_object
 from ironbridge.shared.derive.restate_workflow import agent_run_workflow
 from ironbridge.shared.framework import registry
+from ironbridge.platform.agents.registry import agent_registry
 from services.channels.adapters.cli import CliAdapter  # noqa: F401 — registers "cli" adapter
 from services.channels.adapters.web import WebAdapter  # noqa: F401 — registers "web" adapter
+
+# ── Validate all registered agents are instantiable ───────────────────────────
+agent_registry.validate_all()
 
 # ── Derive Restate VirtualObjects ──────────────────────────────────────────────
 restate_services = [
@@ -51,9 +57,10 @@ restate_app = restate.app(services=restate_services)
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 fastapi_app = FastAPI()
+_cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
 fastapi_app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

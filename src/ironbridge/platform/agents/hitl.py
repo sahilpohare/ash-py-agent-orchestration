@@ -220,6 +220,7 @@ def _call_add_message(
         ).hexdigest()[:16]
     httpx.post(
         f"{restate_base}/Thread/{thread_id}/add_message",
+        headers={"idempotency-key": idempotency_key},
         json={
             "participant_id": f"agent-run-{run_id}",
             "participant_type": "AGENT",

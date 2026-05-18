@@ -205,6 +205,8 @@ def _attach_handler(
 
             def _run():
                 with tenant_session(tenant_id) as db:
+                    if action_ctx is not None:
+                        action_ctx.session = db
                     repo = SqlAlchemyRepository(db, _cls)
                     instance = repo.find_by_id(ctx.key()) or _cls()
                     instance.id = ctx.key()

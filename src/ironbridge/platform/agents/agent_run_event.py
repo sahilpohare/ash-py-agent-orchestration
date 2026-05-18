@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, String, UniqueConstraint
+from sqlalchemy import DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ironbridge.shared.framework.resource import Resource
@@ -18,9 +18,6 @@ class AgentRunEvent(Resource):
         tenant_scoped = True
 
     __tablename__ = "agent_run_events"
-    __table_args__ = (
-        UniqueConstraint("run_id", "event_type", name="uq_agent_run_events_run_event"),
-    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     thread_id: Mapped[str] = mapped_column(String, nullable=False, index=True)

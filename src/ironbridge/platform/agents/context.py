@@ -18,7 +18,6 @@ from datetime import timedelta
 from typing import Any
 
 from restate.exceptions import RetryableError, TerminalError
-from sqlalchemy import text
 
 from ironbridge.platform.agents.agent_run import AgentRunRequest
 from ironbridge.platform.agents.hitl import HITL, HumanResponse, _call_add_message
@@ -92,14 +91,15 @@ class AgentContext:
         """
         return await self._ctx.run(name, fn)
 
-    def get_history(self) -> list[dict]:
+    def get_history(self, limit: int = 200) -> list[dict]:
         """
         Fetch thread message history from DB.
         Sync — designed to be called inside step() or run():
             history = await ctx.step("fetch_history", ctx.get_history)
         Filters control messages (response_reply, event) not visible to LLM.
+        limit: max messages returned (default 200, newest first after filter).
         """
-        return _fetch_thread(self.thread_id, self.tenant_id)
+        return _fetch_thread(self.thread_id, self.tenant_id, limit=limit)
 
     def write_message(self, content: dict, message_count: int) -> None:
         """
@@ -160,7 +160,7 @@ class AgentContext:
             if not approval.approved:
                 return f"Tool `{tool.name}` was denied by the user."
 
-        name = step_name or f"{tool.name}:{':'.join(str(v) for v in kwargs.values())}"
+        name = step_name or f"{tool.name}:{':'.join(str(kwargs[k]) for k in sorted(kwargs))}"
         return await self.step(name, lambda: tool._run(**kwargs))
 
     async def request_approval(
@@ -192,37 +192,20 @@ class AgentContext:
 # ── Internal DB helpers ────────────────────────────────────────────────────────
 
 
-def _fetch_thread(thread_id: str, tenant_id: str) -> list[dict]:
+def _fetch_thread(thread_id: str, tenant_id: str, limit: int = 200) -> list[dict]:
     """
-    Fetch thread message history directly from DB.
+    Fetch thread message history via Thread.get_messages domain action.
     Filters control messages (response_reply, event) — not visible to LLM.
     """
-    with tenant_session(tenant_id) as db:
-        rows = db.execute(
-            text(
-                "SELECT id, participant_id, participant_type, role, content, position "
-                "FROM messages WHERE thread_id = :tid ORDER BY position"
-            ),
-            {"tid": thread_id},
-        ).fetchall()
+    from ironbridge.platform.sessions.thread import Thread
+    from ironbridge.shared.derive.repository import SqlAlchemyRepository
 
-    msgs = []
-    for r in rows:
-        content = r[4] if isinstance(r[4], dict) else json.loads(r[4] or "{}")
-        parts = content.get("parts", [])
-        if any(p.get("type") in ("response_reply", "event") for p in parts):
-            continue
-        msgs.append(
-            {
-                "id": r[0],
-                "participant_id": r[1],
-                "participant_type": r[2],
-                "role": r[3],
-                "content": content,
-                "position": r[5],
-            }
-        )
-    return msgs
+    with tenant_session(tenant_id) as db:
+        repo = SqlAlchemyRepository(db, Thread)
+        instance = repo.find_by_id(thread_id)
+        if instance is None:
+            return []
+        return instance.get_messages(limit=limit)
 
 
 def _write_retry_event(

@@ -51,7 +51,6 @@ class Agent(Resource):
         instructions: str | None = None,
         tools: dict | None = None,
     ) -> "Agent":
-        self.id = _cuid()
         self.name = name
         self.model = model
         self.instructions = instructions

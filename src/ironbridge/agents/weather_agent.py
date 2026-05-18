@@ -38,22 +38,28 @@ _TOOLS = [
 ]
 
 
-def _llm_call(messages: list, tools=None) -> dict:
+def _make_client() -> tuple["OpenAI", str]:
+    """Build (client, model) from env. Called once at module load."""
     api_key = os.environ.get("LLM_API_KEY") or os.environ.get("CEREBRAS_API_KEY", "")
     base_url = os.environ.get("LLM_BASE_URL") or "https://api.cerebras.ai/v1"
     model = os.environ.get("LLM_MODEL", "llama3.1-8b")
-    # Strip LiteLLM provider prefix — OpenAI client uses bare model name with base_url
     if model.startswith("openrouter/"):
         model = model[len("openrouter/"):]
         base_url = "https://openrouter.ai/api/v1"
     elif "/" in model and not model.startswith("http"):
         model = model.split("/", 1)[-1]
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    kwargs = {"model": model, "messages": messages}
+    return OpenAI(api_key=api_key, base_url=base_url), model
+
+
+_llm_client, _llm_model = _make_client()
+
+
+def _llm_call(messages: list, tools=None) -> dict:
+    kwargs: dict = {"model": _llm_model, "messages": messages}
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
-    resp = client.chat.completions.create(**kwargs)
+    resp = _llm_client.chat.completions.create(**kwargs)
     msg = resp.choices[0].message
     return {
         "content": msg.content or "",

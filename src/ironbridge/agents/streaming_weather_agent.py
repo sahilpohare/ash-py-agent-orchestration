@@ -126,13 +126,13 @@ class StreamingWeatherAgent(BaseAgent):
         history = await ctx.step("fetch_history", ctx.get_history)
 
         last_user = next(
-            (m for m in reversed(history) if m.get("role") == "USER"),
+            (m for m in reversed(history) if m.role == "USER"),
             None,
         )
         if not last_user:
             return
 
-        parts = last_user.get("content", {}).get("parts", [])
+        parts = last_user.content.get("parts", [])
         user_text = next((p.get("text", "") for p in parts if p.get("type") == "text"), "")
         if not user_text:
             return
