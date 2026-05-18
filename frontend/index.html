@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<head>
+  <title>Ironbridge</title>
+  <script src="https://js.pusher.com/8.4.0/pusher.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #f5f5f5; height: 100vh; display: flex; flex-direction: column; }
+    header { background: #1a1a1a; color: #fff; padding: 12px 20px; font-size: 15px; font-weight: 600; letter-spacing: 0.05em; display: flex; align-items: center; gap: 10px; }
+    #dot { width: 8px; height: 8px; border-radius: 50%; background: #555; }
+    #dot.on { background: #22c55e; }
+    #bar { display: flex; gap: 8px; padding: 10px 20px; background: #fff; border-bottom: 1px solid #e0e0e0; }
+    #bar input { flex: 1; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+    button { padding: 6px 14px; border: none; border-radius: 4px; background: #1a1a1a; color: #fff; font-size: 13px; cursor: pointer; }
+    button:disabled { background: #aaa; cursor: not-allowed; }
+    #status { font-size: 12px; color: #888; padding: 5px 20px; background: #fafafa; border-bottom: 1px solid #ececec; }
+    #msgs { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 10px; }
+    .msg { max-width: 60%; padding: 8px 12px; border-radius: 8px; font-size: 14px; line-height: 1.5; }
+    .human { align-self: flex-end; background: #1a1a1a; color: #fff; }
+    .agent  { align-self: flex-start; background: #fff; border: 1px solid #e0e0e0; }
+    .meta   { font-size: 10px; opacity: 0.45; margin-top: 3px; }
+    .hitl   { align-self: flex-start; background: #fffbeb; border: 1px solid #f59e0b; border-radius: 8px; padding: 10px 14px; max-width: 70%; font-size: 14px; }
+    .hitl .prompt { margin-bottom: 8px; font-weight: 500; color: #92400e; }
+    .hitl .context { font-size: 12px; color: #78350f; background: #fef3c7; border-radius: 4px; padding: 4px 8px; margin-bottom: 8px; font-family: monospace; white-space: pre-wrap; }
+    .hitl .opts { display: flex; gap: 6px; flex-wrap: wrap; }
+    .hitl .opt { padding: 5px 12px; border-radius: 4px; border: 1px solid #d97706; background: #fff; color: #92400e; font-size: 13px; cursor: pointer; }
+    .hitl .opt:hover { background: #d97706; color: #fff; }
+    .hitl .opt.sent { background: #d1fae5; border-color: #10b981; color: #065f46; cursor: default; }
+    .system { align-self: center; font-size: 12px; color: #888; font-style: italic; padding: 2px 0; }
+    .sys-running { align-self: center; font-size: 12px; color: #3b82f6; font-style: italic; padding: 2px 0; display: flex; align-items: center; gap: 5px; }
+    .sys-running::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #3b82f6; animation: pulse 1.2s ease-in-out infinite; }
+    .sys-queued { align-self: center; font-size: 12px; color: #f59e0b; font-style: italic; padding: 2px 0; }
+    .sys-failed { align-self: center; font-size: 12px; color: #ef4444; font-style: italic; padding: 2px 0; }
+    .sys-orphaned { align-self: center; font-size: 12px; color: #a855f7; font-style: italic; padding: 2px 0; }
+    .sys-retry { align-self: center; font-size: 12px; color: #f97316; font-style: italic; padding: 2px 0; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+    #compose { display: flex; gap: 8px; padding: 12px 20px; background: #fff; border-top: 1px solid #e0e0e0; }
+    #compose textarea { flex: 1; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; resize: none; height: 40px; font-family: inherit; }
+  </style>
+</head>
+<body>
+
+<header>
+  IRONBRIDGE
+  <div id="dot"></div>
+  <span id="conn" style="font-size:12px;opacity:0.6">disconnected</span>
+</header>
+
+<div id="bar">
+  <input id="tenant" value="tenant-a" placeholder="Tenant" style="width:100px" />
+  <input id="uname" value="alice" placeholder="User" style="width:80px" />
+  <input id="agent" value="weather" placeholder="Agent" style="width:80px" />
+  <span style="color:#aaa;font-size:13px">/thread/</span>
+  <input id="tid" placeholder="Thread ID (blank = generate)" />
+  <button onclick="openThread()">Open</button>
+</div>
+
+<div id="status">No thread open.</div>
+<div id="msgs"></div>
+
+<div id="compose">
+  <textarea id="txt" placeholder="Type a message…" onkeydown="onKey(event)" disabled></textarea>
+  <button id="send" onclick="send()" disabled>Send</button>
+</div>
+
+<script>
+  Pusher.logToConsole = true;
+
+  const RESTATE = 'http://localhost:8080';
+  let threadId, pusher, channel, n = 0;
+  const runningEls = new Map(); // run_id → DOM element
+
+  async function openThread() {
+    const id = document.getElementById('tid').value.trim();
+    threadId = id || 'thread-' + Math.random().toString(36).slice(2,10);
+    document.getElementById('tid').value = threadId;
+    const tenant = document.getElementById('tenant').value.trim();
+
+    status(`Opening ${tenant}/thread/${threadId}…`);
+    document.getElementById('msgs').innerHTML = '';
+
+    const user = document.getElementById('uname').value.trim();
+
+    await post(`/Thread/${threadId}/create`, { tenant_id: tenant, user_name: user });
+    await fetch(`/api/${tenant}/channels/web/bind`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Tenant-Id': tenant, 'X-User-Name': user },
+      body: JSON.stringify({ thread_id: threadId }),
+    });
+
+    const t = await post(`/Thread/${threadId}/get`, { tenant_id: tenant, user_name: user });
+    const msgs = t.messages || [];
+    const repliedIds = new Map();
+    for (const m of msgs)
+      for (const p of (m.content?.parts || []))
+        if (p.type === 'response_reply') repliedIds.set(p.request_id, (p.selected || []).join(', '));
+    for (const m of msgs) render(m, repliedIds);
+
+    if (pusher) pusher.disconnect();
+    pusher = new Pusher('1b7510b1c7f4516885e6', { cluster: 'eu' });
+    channel = pusher.subscribe('thread-' + threadId);
+    channel.bind('pusher:subscription_succeeded', () => {
+      conn(true);
+      document.getElementById('txt').disabled = false;
+      document.getElementById('send').disabled = false;
+      document.getElementById('txt').focus();
+    });
+    channel.bind('message_added', render);
+    pusher.connection.bind('disconnected', () => conn(false));
+
+    status(`${tenant}/thread/${threadId}`);
+  }
+
+  async function send() {
+    const ta = document.getElementById('txt');
+    const text = ta.value.trim();
+    if (!text || !threadId) return;
+    ta.value = '';
+    ta.disabled = true;
+    document.getElementById('send').disabled = true;
+    const tenant = document.getElementById('tenant').value.trim();
+    const user = document.getElementById('uname').value.trim();
+    ++n;
+    await fetch(`/api/${tenant}/channels/web/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Tenant-Id': tenant, 'X-User-Name': user },
+      body: JSON.stringify({
+        thread_id: threadId,
+        text,
+        participant_id: user,
+        agent_id: document.getElementById('agent').value.trim() || 'stub',
+      }),
+    });
+
+    // Show "agent is running" indicator until first agent message or failure
+    const box = document.getElementById('msgs');
+    const runEl = document.createElement('div');
+    runEl.className = 'sys-running';
+    runEl.textContent = 'agent is running…';
+    box.appendChild(runEl);
+    runningEls.set('pending:' + n, runEl);
+    box.scrollTop = box.scrollHeight;
+
+    ta.disabled = false;
+    document.getElementById('send').disabled = false;
+    ta.focus();
+  }
+
+  function onKey(e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  }
+
+  async function post(path, body) {
+    const r = await fetch(RESTATE + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return r.json();
+  }
+
+  function render(msg, repliedIds) {
+    const box = document.getElementById('msgs');
+    const parts = msg.content?.parts || [];
+    const type = (msg.participant_type || '').toLowerCase();
+
+    // Check for special part types first
+    for (const part of parts) {
+      if (part.type === 'response_request') {
+        _clearAllPending();
+        renderHITL(box, msg, part, repliedIds);
+        box.scrollTop = box.scrollHeight;
+        return;
+      }
+      if (part.type === 'event') {
+        renderEvent(box, part, msg);
+        box.scrollTop = box.scrollHeight;
+        return;
+      }
+      if (part.type === 'response_reply') {
+        // Collapse the HITL card for all windows — find by request_id and remove buttons.
+        const hitlCard = box.querySelector(`.hitl[data-request-id="${CSS.escape(part.request_id)}"]`);
+        if (hitlCard) {
+          hitlCard.querySelector('.opts')?.remove();
+          hitlCard.querySelector('.context')?.remove();
+          const meta = hitlCard.querySelector('.meta');
+          if (meta && !meta.innerHTML.includes('replied:'))
+            meta.innerHTML += ` · replied: <strong>${esc((part.selected || []).join(', '))}</strong>`;
+        }
+        const d = document.createElement('div');
+        d.className = 'msg human';
+        d.innerHTML = `<div>${esc((part.selected || []).join(', '))}</div><div class="meta">${esc(msg.participant_id || '')} · #${msg.position}</div>`;
+        box.appendChild(d);
+        box.scrollTop = box.scrollHeight;
+        return;
+      }
+    }
+
+    // text_delta: append chunk to live streaming bubble
+    if (parts.some(p => p.type === 'text_delta')) {
+      const chunk = parts.map(p => p.type === 'text_delta' ? (p.text || '') : '').join('');
+      const streamId = 'stream-' + msg.participant_id;
+      let bubble = box.querySelector(`[data-stream-id="${CSS.escape(streamId)}"]`);
+      if (!bubble) {
+        bubble = document.createElement('div');
+        bubble.className = 'msg agent';
+        bubble.dataset.streamId = streamId;
+        bubble.innerHTML = `<div class="stream-text"></div><div class="meta">${esc(msg.participant_id || '')} · streaming…</div>`;
+        box.appendChild(bubble);
+      }
+      bubble.querySelector('.stream-text').textContent += chunk;
+      box.scrollTop = box.scrollHeight;
+      return;
+    }
+
+    // stream_end: finalise the streaming bubble
+    if (parts.some(p => p.type === 'stream_end')) {
+      _clearAllPending();
+      const streamId = 'stream-' + msg.participant_id;
+      const bubble = box.querySelector(`[data-stream-id="${CSS.escape(streamId)}"]`);
+      if (bubble) {
+        bubble.querySelector('.meta').textContent = (msg.participant_id || '') + ' · done';
+        delete bubble.dataset.streamId;
+      }
+      box.scrollTop = box.scrollHeight;
+      return;
+    }
+
+    const text = parts.map(p => p.text || '').join('');
+    if (!text) return;
+
+    // Clear any pending running indicators when agent responds
+    if (type !== 'human') _clearAllPending();
+
+    const d = document.createElement('div');
+    d.className = 'msg ' + (type === 'human' ? 'human' : 'agent');
+    d.innerHTML = `<div>${esc(text)}</div><div class="meta">${esc(msg.participant_id || '')} · #${msg.position}</div>`;
+    box.appendChild(d);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function renderHITL(box, msg, part, repliedIds) {
+    const d = document.createElement('div');
+    d.className = 'hitl';
+    d.dataset.requestId = part.request_id;
+
+    const reply = repliedIds instanceof Map ? repliedIds.get(part.request_id) : null;
+    const ctx = part.context ? JSON.stringify(part.context, null, 2) : null;
+
+    if (reply) {
+      // Already replied — show as plain text summary, no buttons
+      d.innerHTML = `
+        <div class="prompt">${esc(part.prompt || 'Approval required')}</div>
+        <div class="meta">${esc(msg.participant_id || '')} · #${msg.position} · replied: <strong>${esc(reply)}</strong></div>
+      `;
+    } else {
+      const optsHtml = (part.options || []).map(opt =>
+        `<button class="opt" onclick="submitHITL(this, '${esc(part.request_id)}', '${esc(opt.id)}', '${esc(part.created_by || '')}')">${esc(opt.label)}</button>`
+      ).join('');
+      d.innerHTML = `
+        <div class="prompt">${esc(part.prompt || 'Approval required')}</div>
+        ${ctx ? `<div class="context">${esc(ctx)}</div>` : ''}
+        <div class="opts">${optsHtml}</div>
+        <div class="meta">${esc(msg.participant_id || '')} · #${msg.position}</div>
+      `;
+    }
+    box.appendChild(d);
+  }
+
+  function renderEvent(box, part, msg) {
+    const ev = part.event || 'event';
+    const run_id = part.run_id || (msg && msg.participant_id && msg.participant_id.startsWith('agent-run-') ? msg.participant_id.slice('agent-run-'.length) : null);
+    const d = document.createElement('div');
+
+    if (ev === 'AGENT_RUN_QUEUED') {
+      d.className = 'sys-queued';
+      d.textContent = `queued · position ${part.queue_position ?? '?'}`;
+      if (run_id) runningEls.set('queued:' + run_id, d);
+    } else if (ev === 'AGENT_RUN_FAILED') {
+      // Remove any running indicator for this run
+      _clearRunning(run_id);
+      d.className = 'sys-failed';
+      d.textContent = `agent failed${part.error ? ': ' + part.error : ''}`;
+    } else if (ev === 'AGENT_RUN_RETRY') {
+      d.className = 'sys-retry';
+      d.textContent = `retrying${part.step ? ' · ' + part.step : ''}${part.error ? ': ' + part.error : ''}`;
+    } else if (ev === 'AGENT_RUN_ORPHANED') {
+      d.className = 'sys-orphaned';
+      d.textContent = `orphaned run · no active agent to handle reply`;
+    } else {
+      d.className = 'system';
+      d.textContent = `[${ev}${part.request_id ? ' · ' + part.request_id : ''}]`;
+    }
+
+    box.appendChild(d);
+  }
+
+  function _clearAllPending() {
+    for (const [k, el] of runningEls) {
+      if (k.startsWith('pending:') && el.parentNode) el.remove();
+      runningEls.delete(k);
+    }
+  }
+
+  function _clearRunning(run_id) {
+    if (!run_id) return;
+    const el = runningEls.get(run_id);
+    if (el && el.parentNode) el.remove();
+    runningEls.delete(run_id);
+    // Also clear queued indicator
+    const qel = runningEls.get('queued:' + run_id);
+    if (qel && qel.parentNode) qel.remove();
+    runningEls.delete('queued:' + run_id);
+  }
+
+  async function submitHITL(btn, requestId, selectedId, agentParticipantId) {
+    const hitlDiv = btn.closest('.hitl');
+    const prompt = hitlDiv.querySelector('.prompt')?.textContent || '';
+    // Replace buttons with plain text immediately
+    hitlDiv.querySelector('.opts')?.remove();
+    hitlDiv.querySelector('.context')?.remove();
+    const meta = hitlDiv.querySelector('.meta');
+    if (meta) meta.innerHTML += ` · replied: <strong>${esc(selectedId)}</strong>`;
+
+    const tenant = document.getElementById('tenant').value.trim();
+    const user = document.getElementById('uname').value.trim();
+    await post(`/Thread/${threadId}/add_message`, {
+      participant_id: user,
+      participant_type: 'HUMAN',
+      role: 'USER',
+      content: {
+        version: 1,
+        parts: [{
+          type: 'response_reply',
+          request_id: requestId,
+          selected: [selectedId],
+          created_by: agentParticipantId,
+        }]
+      },
+      idempotency_key: `hitl-${requestId}-${selectedId}-${Date.now()}`,
+      tenant_id: tenant,
+      user_name: user,
+      agent_id: agentParticipantId,
+    });
+  }
+
+  function status(s) { document.getElementById('status').textContent = s; }
+  function conn(on) {
+    document.getElementById('dot').className = on ? 'on' : '';
+    document.getElementById('conn').textContent = on ? 'live' : 'disconnected';
+  }
+  function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+</script>
+</body>
+</html>

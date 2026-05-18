@@ -1,0 +1,73 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ironbridge
+      POSTGRES_PASSWORD: ironbridge
+      POSTGRES_DB: ironbridge
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ironbridge"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  restate:
+    image: docker.restate.dev/restatedev/restate:latest
+    ports:
+      - "8080:8080"   # ingress — clients call here
+      - "9070:9070"   # admin UI + registration
+    environment:
+      RESTATE_LOG_FILTER: "restate=info"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9070/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9080:9080"   # Restate calls in here to invoke handlers
+    volumes:
+      - ./src:/app/src
+      - ./services:/app/services
+      - ./frontend:/app/frontend
+    environment:
+      DATABASE_URL: postgresql://app:app@postgres:5432/ironbridge
+      ALEMBIC_URL: postgresql://ironbridge:ironbridge@postgres:5432/ironbridge
+      RESTATE_URL: http://restate:8080
+      PYTHONDONTWRITEBYTECODE: "1"
+      PUSHER_APP_ID: "${PUSHER_APP_ID}"
+      PUSHER_KEY: "${PUSHER_KEY}"
+      PUSHER_SECRET: "${PUSHER_SECRET}"
+      PUSHER_CLUSTER: "${PUSHER_CLUSTER:-eu}"
+      CEREBRAS_API_KEY: "${CEREBRAS_API_KEY}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      restate:
+        condition: service_healthy
+    command: >
+      sh -c "
+        DATABASE_URL=$$ALEMBIC_URL alembic upgrade head &&
+        python -m hypercorn ironbridge.main:app --bind 0.0.0.0:9080 &
+        until curl -sf http://localhost:9080/discover > /dev/null 2>&1; do sleep 1; done &&
+        curl -sf --retry 5 --retry-delay 2
+          http://restate:9070/deployments
+          -H 'content-type: application/json'
+          -d '{\"uri\": \"http://app:9080\", \"force\": true}' &&
+        wait
+      "
+
+volumes:
+  postgres_data:
