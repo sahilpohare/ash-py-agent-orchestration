@@ -168,6 +168,19 @@ class Thread(Resource):
             ],
         }
 
+    @action(kind=ActionKind.READ)
+    def list(self) -> dict:
+        with tenant_session(self.tenant_id) as db:
+            rows = db.execute(
+                text("SELECT id, created_at, updated_at FROM threads ORDER BY created_at DESC"),
+            ).fetchall()
+        return {
+            "threads": [
+                {"id": r[0], "created_at": r[1].isoformat() if r[1] else None, "updated_at": r[2].isoformat() if r[2] else None}
+                for r in rows
+            ]
+        }
+
     @action(kind=ActionKind.STREAM)
     def observe(self) -> "Thread":
         return self

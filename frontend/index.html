@@ -6,6 +6,17 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: system-ui, sans-serif; background: #f5f5f5; height: 100vh; display: flex; flex-direction: column; }
+    #layout { display: flex; flex: 1; overflow: hidden; }
+    #sidebar { width: 220px; min-width: 220px; background: #fff; border-right: 1px solid #e0e0e0; display: flex; flex-direction: column; overflow: hidden; }
+    #sidebar-header { padding: 10px 14px; font-size: 12px; font-weight: 600; color: #555; border-bottom: 1px solid #ececec; display: flex; justify-content: space-between; align-items: center; }
+    #sidebar-header button { padding: 3px 8px; font-size: 11px; }
+    #thread-list { flex: 1; overflow-y: auto; }
+    .thread-item { padding: 9px 14px; font-size: 12px; cursor: pointer; border-bottom: 1px solid #f0f0f0; color: #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .thread-item:hover { background: #f5f5f5; }
+    .thread-item.active { background: #1a1a1a; color: #fff; }
+    .thread-item .tid { font-family: monospace; font-size: 11px; }
+    .thread-item .ts { font-size: 10px; opacity: 0.5; margin-top: 2px; }
+    #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
     header { background: #1a1a1a; color: #fff; padding: 12px 20px; font-size: 15px; font-weight: 600; letter-spacing: 0.05em; display: flex; align-items: center; gap: 10px; }
     #dot { width: 8px; height: 8px; border-radius: 50%; background: #555; }
     #dot.on { background: #22c55e; }
@@ -61,6 +72,12 @@
   <button onclick="openThread()">Open</button>
 </div>
 
+<div id="layout">
+<div id="sidebar">
+  <div id="sidebar-header">THREADS <button onclick="loadThreadList()">↺</button></div>
+  <div id="thread-list"></div>
+</div>
+<div id="main">
 <div id="status">No thread open.</div>
 <div id="msgs"></div>
 
@@ -68,13 +85,41 @@
   <textarea id="txt" placeholder="Type a message…" onkeydown="onKey(event)" disabled></textarea>
   <button id="send" onclick="send()" disabled>Send</button>
 </div>
+</div><!-- #main -->
+</div><!-- #layout -->
 
 <script>
   Pusher.logToConsole = true;
 
   const RESTATE = 'http://localhost:8082';
   let threadId, pusher, channel, n = 0;
+
+  function insertSorted(box, el, position) {
+    if (position == null) { box.appendChild(el); return; }
+    const siblings = box.children;
+    for (let i = siblings.length - 1; i >= 0; i--) {
+      const pos = parseInt(siblings[i].dataset.position, 10);
+      if (!isNaN(pos) && pos <= position) { siblings[i].after(el); return; }
+    }
+    box.prepend(el);
+  }
   const runningEls = new Map(); // run_id → DOM element
+
+  async function loadThreadList() {
+    const tenant = document.getElementById('tenant').value.trim();
+    const data = await post(`/Thread/_/list`, { tenant_id: tenant });
+    const list = document.getElementById('thread-list');
+    list.innerHTML = '';
+    for (const t of (data.threads || [])) {
+      const d = document.createElement('div');
+      d.className = 'thread-item' + (t.id === threadId ? ' active' : '');
+      d.dataset.tid = t.id;
+      const ts = t.updated_at ? new Date(t.updated_at).toLocaleString() : '';
+      d.innerHTML = `<div class="tid">${esc(t.id)}</div><div class="ts">${esc(ts)}</div>`;
+      d.onclick = () => { document.getElementById('tid').value = t.id; openThread(); };
+      list.appendChild(d);
+    }
+  }
 
   async function openThread() {
     const id = document.getElementById('tid').value.trim();
@@ -95,7 +140,7 @@
     });
 
     const t = await post(`/Thread/${threadId}/get`, { tenant_id: tenant, user_name: user });
-    const msgs = t.messages || [];
+    const msgs = (t.messages || []).slice().sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
     const repliedIds = new Map();
     for (const m of msgs)
       for (const p of (m.content?.parts || []))
@@ -115,6 +160,7 @@
     pusher.connection.bind('disconnected', () => conn(false));
 
     status(`${tenant}/thread/${threadId}`);
+    loadThreadList();
   }
 
   async function send() {
@@ -195,8 +241,9 @@
         }
         const d = document.createElement('div');
         d.className = 'msg human';
+        d.dataset.position = msg.position ?? '';
         d.innerHTML = `<div>${esc((part.selected || []).join(', '))}</div><div class="meta">${esc(msg.participant_id || '')} · #${msg.position}</div>`;
-        box.appendChild(d);
+        insertSorted(box, d, msg.position);
         box.scrollTop = box.scrollHeight;
         return;
       }
@@ -243,9 +290,10 @@
 
     const d = document.createElement('div');
     d.className = 'msg ' + (type === 'human' ? 'human' : 'agent');
+    d.dataset.position = msg.position ?? '';
     const body = type === 'human' ? `<div>${esc(text)}</div>` : `<div class="md">${marked.parse(text)}</div>`;
     d.innerHTML = body + `<div class="meta">${esc(msg.participant_id || '')} · #${msg.position}</div>`;
-    box.appendChild(d);
+    insertSorted(box, d, msg.position);
     box.scrollTop = box.scrollHeight;
   }
 
@@ -274,7 +322,8 @@
         <div class="meta">${esc(msg.participant_id || '')} · #${msg.position}</div>
       `;
     }
-    box.appendChild(d);
+    d.dataset.position = msg.position ?? '';
+    insertSorted(box, d, msg.position);
   }
 
   function renderEvent(box, part, msg) {
