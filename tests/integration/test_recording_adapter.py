@@ -336,8 +336,9 @@ def test_stub_agent_llm_echo_produces_text_part(adapter):
     Does NOT test the full delivery pipeline (requires running stack).
     """
     from ironbridge.agents.stub import _call_llm
+    from ironbridge.platform.sessions.thread import MessageView
 
-    history = [{"role": "USER", "content": {"parts": [{"type": "text", "text": "hello"}]}}]
+    history = [MessageView(id="m1", participant_id="alice", participant_type="HUMAN", role="USER", content={"parts": [{"type": "text", "text": "hello"}]}, position=1)]
 
     response = _call_llm(history)
 
@@ -385,8 +386,9 @@ def test_stub_agent_llm_non_user_last_returns_done_empty():
     Post: _call_llm returns done=True with empty content — agent loop terminates
     """
     from ironbridge.agents.stub import _call_llm
+    from ironbridge.platform.sessions.thread import MessageView
 
-    history = [{"role": "ASSISTANT", "content": {"parts": [{"type": "text", "text": "done"}]}}]
+    history = [MessageView(id="m1", participant_id="agent-1", participant_type="AGENT", role="ASSISTANT", content={"parts": [{"type": "text", "text": "done"}]}, position=1)]
 
     result = _call_llm(history)
 
