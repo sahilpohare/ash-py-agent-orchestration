@@ -84,4 +84,4 @@ def resolve_agent_for_channel(channel_id: str, tenant_id: str | None) -> str:
     with tenant_session(tenant_id) as db:
         repo = SqlAlchemyRepository(db, Channel)
         channel = repo.find_by_id(channel_id)
-    return channel.default_agent_id if channel else "stub"
+        return channel.default_agent_id if channel else "stub"

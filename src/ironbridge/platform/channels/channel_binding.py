@@ -44,4 +44,4 @@ def resolve_channels_for_thread(thread_id: str, tenant_id: str | None) -> list[s
     with tenant_session(tenant_id) as db:
         repo = SqlAlchemyRepository(db, ChannelBinding)
         bindings = repo.list(thread_id=thread_id)
-    return [b.channel_id for b in bindings]
+        return [b.channel_id for b in bindings]

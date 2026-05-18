@@ -21,12 +21,12 @@ import logging
 from typing import Any
 
 import restate
-from sqlalchemy import text
 
 from ironbridge.platform.channels.context import ChannelContext
 from ironbridge.platform.channels.message import ChannelMessage
 from ironbridge.platform.channels.registry import get_adapter
 from ironbridge.shared.db import tenant_session
+from ironbridge.shared.derive.repository import SqlAlchemyRepository
 
 logger = logging.getLogger(__name__)
 
@@ -58,16 +58,16 @@ async def deliver(ctx: Any, req: dict | None) -> None:
     channel_ctx = ChannelContext(ctx, thread_id, channel_id, tenant_id)
 
     def _load_and_dispatch():
+        from ironbridge.platform.channels.channel import Channel
         with tenant_session(tenant_id) as db:
-            row = db.execute(
-                text("SELECT channel_type, config FROM channels WHERE id = :cid LIMIT 1"),
-                {"cid": channel_id},
-            ).fetchone()
-        if not row:
-            logger.warning("deliver: channel %s not found in DB", channel_id)
-            return
+            repo = SqlAlchemyRepository(db, Channel)
+            channel = repo.find_by_id(channel_id)
+            if not channel:
+                logger.warning("deliver: channel %s not found in DB", channel_id)
+                return
+            channel_type = channel.channel_type
+            config = channel.config or {}
 
-        channel_type, config = row[0], row[1] or {}
         adapter = get_adapter(channel_type)
         if not adapter:
             logger.warning("deliver: no adapter for channel_type=%s", channel_type)
