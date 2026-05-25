@@ -190,6 +190,7 @@ WORKFLOW_HANDLERS: dict[tuple[str, str], tuple[Any, Any]] = {
     ("AgentRun", "run"): (run, AgentRunRequest),
     ("AgentRun", "resolve_hitl"): (resolve_hitl, ResolveHITLRequest),
     ("AgentRun", "cancel"): (cancel, None),
+    ("AgentRun", "status"): (status, None),
 }
 
 

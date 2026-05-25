@@ -10,7 +10,6 @@ Pusher event: "message_added"
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 
@@ -110,18 +109,14 @@ class WebAdapter(BaseChannelAdapter):
             if not header_user:
                 raise HTTPException(status_code=401, detail="X-User-Name header required")
 
-            content = body.content or {"version": 1, "parts": [{"type": "text", "text": body.text}]}
-            ikey = hashlib.sha256(
-                f"{body.thread_id}:{body.participant_id or header_user}:{str(content)[:128]}".encode()
-            ).hexdigest()[:16]
             background_tasks.add_task(
                 self.receive,
-                content=content,
                 thread_id=body.thread_id,
                 tenant_id=tenant_id,
                 participant_id=body.participant_id or header_user,
+                text=body.text,
+                content=body.content,
                 agent_id=body.agent_id,
-                idempotency_key=ikey,
             )
             return JSONResponse({"ok": True})
 

@@ -72,6 +72,21 @@ class Channel(Resource):
         self.status = "INACTIVE"
         return self
 
+    @action(kind=ActionKind.UPDATE)
+    def set_thread_mapping(self, external_channel_id: str, thread_id: str) -> "Channel":
+        """Map an external channel ID (e.g. Discord channel) to an Ironbridge thread_id."""
+        config = dict(self.config or {})
+        threads = dict(config.get("threads", {}))
+        threads[external_channel_id] = thread_id
+        config["threads"] = threads
+        self.config = config
+        return self
+
+    @action(kind=ActionKind.READ)
+    def get_thread_mapping(self, external_channel_id: str) -> str | None:
+        """Return the thread_id for an external channel ID, or None."""
+        return (self.config or {}).get("threads", {}).get(external_channel_id)
+
     @action(kind=ActionKind.READ)
     def get(self) -> "Channel":
         return self

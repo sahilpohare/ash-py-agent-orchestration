@@ -96,10 +96,10 @@ def run_cli(
                 continue
             n += 1
             adapter.receive(
-                content={"version": 1, "parts": [{"type": "text", "text": text_in}]},
                 thread_id=thread_id,
                 tenant_id=tenant_id,
                 participant_id=user,
+                text=text_in,
                 agent_id=agent_id,
                 idempotency_key=f"cli-{thread_id}-{n}",
                 restate_url=restate_url,

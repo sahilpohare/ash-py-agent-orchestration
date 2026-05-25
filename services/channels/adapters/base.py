@@ -1,16 +1,24 @@
 """
-BaseChannelAdapter — abstract base every channel implementation must satisfy.
+BaseChannelAdapter — abstract base every channel adapter must satisfy.
 
-Channel is a view of the thread. The adapter receives every thread message
-and decides what to render. Inbound messages are posted via receive().
+Implementing an adapter requires only:
+  1. Set channel_type = "myservice"
+  2. Implement on_message(message, config, ctx) for outbound delivery
+  3. Use self.receive() for inbound messages
+  4. Use self.get_or_create_thread() to find-or-create a thread for an
+     external conversation (bot adapters)
 
-Registration:
-    from ironbridge.platform.channels.registry import register_adapter
-    register_adapter(MyAdapter())
+Everything else — HTTP transport, idempotency keys, JSON shapes, thread
+binding — is handled by the base class. Adapters never touch Restate internals.
+
+Bot processes (discord, telegram, etc.) are external — they communicate
+with the Ironbridge app via HTTP to Restate ingress. This is correct and
+intentional: bots run outside the app process.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 from abc import ABC, abstractmethod
 
@@ -30,6 +38,62 @@ _cuid = cuid_wrapper()
 class BaseChannelAdapter(ABC):
     channel_type: str  # must override — matches Channel.channel_type in DB
 
+    # ── Adapter interface ─────────────────────────────────────────────────────
+
+    @abstractmethod
+    def on_message(self, message: ChannelMessage, config: dict, ctx: ChannelContext) -> None:
+        """
+        Called by ChannelDelivery for every message added to the thread.
+        Adapter decides what to render and what to ignore.
+
+        message.role        — USER | ASSISTANT | SYSTEM
+        message.parts       — list of typed parts (TextPart, EventPart, etc.)
+        message.thread_id   — originating thread
+        config              — channel.config from DB (credentials, settings)
+        ctx                 — write back to thread (ctx.send_message, ctx.send_event)
+        """
+        ...
+
+    # ── Inbound ───────────────────────────────────────────────────────────────
+
+    def receive(
+        self,
+        thread_id: str,
+        tenant_id: str,
+        participant_id: str,
+        text: str | None = None,
+        content: dict | None = None,
+        agent_id: str | None = None,
+        idempotency_key: str | None = None,
+        restate_url: str | None = None,
+    ) -> None:
+        """
+        Post an inbound message to the thread via Restate ingress.
+
+        Provide either text (plain string) or content (raw content dict).
+        If both are provided, content takes precedence.
+        """
+        body = content or {"version": 1, "parts": [{"type": "text", "text": text or ""}]}
+        ikey = idempotency_key or hashlib.sha256(
+            f"{thread_id}:{participant_id}:{str(body)[:128]}".encode()
+        ).hexdigest()[:16]
+        self._post(
+            f"/Thread/{thread_id}/add_message",
+            {
+                "participant_id": participant_id,
+                "participant_type": "HUMAN",
+                "role": "USER",
+                "content": body,
+                "idempotency_key": ikey,
+                "tenant_id": tenant_id,
+                "user_name": participant_id,
+                **({"agent_id": agent_id} if agent_id else {}),
+            },
+            restate_url=restate_url,
+        )
+
+    # ── Thread management (in-app adapters) ───────────────────────────────────
+
     def get_or_create_channel(self, tenant_id: str) -> str:
         """Return the channel_id for this adapter's channel_type, creating it if needed."""
         with tenant_session(tenant_id) as db:
@@ -43,106 +107,74 @@ class BaseChannelAdapter(ABC):
             db.commit()
             return ch.id
 
-    def new_thread(
-        self,
-        tenant_id: str,
-        channel_id: str,
-        restate_url: str | None = None,
-    ) -> str:
-        """
-        Create a new Thread via Restate, bind it to the channel, and return the
-        thread_id. Call this for /new or any reset command. The adapter is
-        responsible for remembering the returned thread_id as the active thread.
-        """
-        thread_id = _cuid()
-        base = restate_url or os.environ.get("RESTATE_URL", "http://localhost:8080")
-        httpx.post(
-            f"{base}/Thread/{thread_id}/create",
-            json={"tenant_id": tenant_id},
-            timeout=10,
-        )
-        self.bind_thread(tenant_id, thread_id, channel_id)
-        return thread_id
-
     def bind_thread(self, tenant_id: str, thread_id: str, channel_id: str) -> None:
-        """
-        Bind a channel to a thread. Idempotent — safe to call on every inbound
-        message. The channel must already exist (registered by the tenant).
-        The adapter tracks which thread_id is currently active per external conversation.
-        """
+        """Bind a channel to a thread. Idempotent."""
         with tenant_session(tenant_id) as db:
-            binding_repo = SqlAlchemyRepository(db, ChannelBinding)
-            if not binding_repo.find_by(thread_id=thread_id, channel_id=channel_id):
+            repo = SqlAlchemyRepository(db, ChannelBinding)
+            if not repo.find_by(thread_id=thread_id, channel_id=channel_id):
                 binding = ChannelBinding()
                 binding.id = _cuid()
                 binding.thread_id = thread_id
                 binding.channel_id = channel_id
-                binding_repo.save(binding)
+                repo.save(binding)
             db.commit()
 
-    @abstractmethod
-    def on_message(self, message: ChannelMessage, config: dict, ctx: ChannelContext) -> None:
-        """
-        Called by ChannelDelivery for every message added to the thread.
+    def new_thread(self, tenant_id: str, channel_id: str, restate_url: str | None = None) -> str:
+        """Create a new Thread, bind it to the channel, return thread_id."""
+        thread_id = _cuid()
+        self._post(f"/Thread/{thread_id}/create", {"tenant_id": tenant_id}, restate_url=restate_url)
+        self.bind_thread(tenant_id, thread_id, channel_id)
+        return thread_id
 
-        message keys:
-            thread_id        — the thread this message belongs to
-            role             — USER | ASSISTANT | SYSTEM
-            participant_id   — who sent it
-            participant_type — HUMAN | AGENT | SYSTEM
-            content          — {version, parts: [{type, ...}]}
+    # ── Thread management (bot/external adapters) ─────────────────────────────
 
-        Part types:
-            text             — plain text
-            event            — AGENT_RUN_QUEUED/FAILED/ORPHANED/etc.
-            response_request — HITL approval card
-            response_reply   — HITL reply
-            text_delta       — streaming chunk
-            stream_end       — streaming complete
-
-        config — channel.config from DB (credentials, settings).
-        ctx    — ChannelContext for writing back to the thread.
-        """
-        ...
-
-    def get_thread(self, tenant_id: str, thread_id: str, restate_url: str | None = None) -> dict:
-        """Fetch thread + messages via Restate."""
-        base = restate_url or os.environ.get("RESTATE_URL", "http://localhost:8080")
-        r = httpx.post(
-            f"{base}/Thread/{thread_id}/get",
-            json={"tenant_id": tenant_id},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
-
-    def receive(
+    def get_or_create_thread(
         self,
-        content: dict,
-        thread_id: str,
         tenant_id: str,
-        participant_id: str,
-        agent_id: str | None = None,
-        idempotency_key: str | None = None,
-        restate_url: str | None = None,
-    ) -> None:
+        channel_id: str,
+        external_id: str,
+    ) -> str:
         """
-        Post an inbound message to the thread via Restate ingress.
-        HTTP to Restate ingress is the correct external boundary.
+        Return the active thread_id for an external conversation ID,
+        creating a new thread if none exists.
+
+        external_id — stable identifier for the external conversation
+                      (e.g. Discord channel ID, Telegram chat ID)
         """
-        base = restate_url or os.environ.get("RESTATE_URL", "http://localhost:8080")
-        ikey = idempotency_key or f"{thread_id}:{participant_id}:{_cuid()}"
-        httpx.post(
-            f"{base}/Thread/{thread_id}/add_message",
-            json={
-                "participant_id": participant_id,
-                "participant_type": "HUMAN",
-                "role": "USER",
-                "content": content,
-                "idempotency_key": ikey,
-                "tenant_id": tenant_id,
-                "user_name": participant_id,
-                **({"agent_id": agent_id} if agent_id else {}),
-            },
-            timeout=10,
+        thread_id = self._get_thread_mapping(tenant_id, channel_id, external_id)
+        if not thread_id:
+            thread_id = _cuid()
+            self._post(f"/Thread/{thread_id}/create", {"tenant_id": tenant_id})
+            self._set_thread_mapping(tenant_id, channel_id, external_id, thread_id)
+        return thread_id
+
+    def reset_thread(self, tenant_id: str, channel_id: str, external_id: str) -> str:
+        """Start a fresh thread for an external conversation. Returns new thread_id."""
+        thread_id = _cuid()
+        self._post(f"/Thread/{thread_id}/create", {"tenant_id": tenant_id})
+        self._set_thread_mapping(tenant_id, channel_id, external_id, thread_id)
+        return thread_id
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _get_thread_mapping(self, tenant_id: str, channel_id: str, external_id: str) -> str | None:
+        r = self._post(
+            f"/Channel/{channel_id}/get_thread_mapping",
+            {"tenant_id": tenant_id, "external_channel_id": external_id},
         )
+        if r and r.status_code == 200:
+            return r.json() or None
+        return None
+
+    def _set_thread_mapping(self, tenant_id: str, channel_id: str, external_id: str, thread_id: str) -> None:
+        self._post(
+            f"/Channel/{channel_id}/set_thread_mapping",
+            {"tenant_id": tenant_id, "external_channel_id": external_id, "thread_id": thread_id},
+        )
+
+    def _post(self, path: str, body: dict, restate_url: str | None = None) -> httpx.Response | None:
+        base = restate_url or os.environ.get("RESTATE_URL", "http://localhost:8080")
+        try:
+            return httpx.post(f"{base}{path}", json=body, timeout=10)
+        except Exception:
+            return None

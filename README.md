@@ -379,7 +379,7 @@ docs/
 
 ## Development Notes
 
-- **New thread IDs after code changes** — Restate journals are tied to handler code. Use a new thread ID or `podman compose down -v` to clear journals + DB.
+- **Threads are always resumable** — DB is the source of truth. After a deploy, existing threads resume from DB history on the next message. Restate journals are execution cache only — stale journals are discarded. Use `podman compose down -v` only to wipe all state in dev.
 - **Rebuild after Python changes** — `podman compose build app && podman compose up -d app` — registration runs automatically on startup.
 - **`TerminalError` must be re-raised** — never swallow it in Restate handlers.
 - **No HTTP calls inside `ctx.run()` callbacks** — they re-execute on replay.
