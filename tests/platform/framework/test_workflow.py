@@ -142,7 +142,7 @@ class TestWorkflowRegistration:
             async def on_start(self, ctx):
                 pass
 
-        assert Wf.get_entry_handler() == "on_start"
+        assert Wf.get_entry_handler() == "start"
 
     def test_mid_workflow_signal(self):
         class Wf(Workflow):

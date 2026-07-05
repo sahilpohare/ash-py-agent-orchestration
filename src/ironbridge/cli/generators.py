@@ -1,19 +1,18 @@
 """
-Generators - scaffold files and directory structure for resources, workflows, modules.
+Generators - scaffold files and directory structure for resources, workflows, modules, and full apps.
 
 Usage:
-    ironbridge generate resource Job --module maintenance --fields "state:str description:str branch_id:str"
-    ironbridge generate workflow Job --module maintenance --fields "state:str" --signals "start:create quote_received approval"
+    # Individual
+    ironbridge generate resource Job --module maintenance --fields "state:str description:str"
+    ironbridge generate workflow Job --module maintenance --signals "start:create quote_received approval"
     ironbridge generate module maintenance --resources "Job Invoice"
 
-Creates:
-    lightwork/maintenance/
-    lightwork/maintenance/__init__.py
-    lightwork/maintenance/job.py
-    lightwork/maintenance/module.py
-    tests/maintenance/
-    tests/maintenance/__init__.py
-    tests/maintenance/test_job.py
+    # Full app from spec
+    ironbridge generate app --spec app_spec.yaml
+    ironbridge generate app --name lightwork
+
+Creates full project structure with all modules, resources, workflows, connectors,
+subscriptions, web layer, and tests.
 """
 from __future__ import annotations
 
@@ -531,3 +530,517 @@ def _default_for_type(py_type: str) -> str:
         "datetime": "None",
         "Decimal": "None",
     }.get(py_type, "None")
+
+
+# ---------------------------------------------------------------------------
+# Full app generator
+# ---------------------------------------------------------------------------
+
+def generate_app(
+    name: str,
+    modules: list[dict],
+    connectors: list[str] | None = None,
+    base_path: str = ".",
+) -> list[str]:
+    """
+    Scaffold a full app from a spec.
+
+    modules: [
+        {
+            "name": "Maintenance",
+            "resources": [
+                {"name": "Job", "type": "workflow", "fields": [...], "signals": [...], "relationships": [...]},
+                {"name": "Invoice", "type": "resource", "fields": [...], "relationships": [...]},
+            ],
+        },
+        ...
+    ]
+    connectors: ["twilio", "nylas", "anthropic", "alto", "stripe"]
+    """
+    created = []
+    snake_name = _snake(name)
+    src = Path(base_path) / "src"
+    app_dir = src / snake_name
+    web_dir = src / f"{snake_name}_web"
+    test_dir = Path(base_path) / "tests"
+
+    # --- Top-level project files ---
+    created += _write_if_new(Path(base_path) / "pyproject.toml", _pyproject_template(name, snake_name))
+    created += _write_if_new(Path(base_path) / "Dockerfile", _dockerfile_template())
+    created += _write_if_new(Path(base_path) / "docker-compose.yml", _docker_compose_template(snake_name))
+    created += _write_if_new(Path(base_path) / ".env.example", _env_example_template(connectors or []))
+
+    # --- App package ---
+    app_dir.mkdir(parents=True, exist_ok=True)
+    created += _write_if_new(app_dir / "__init__.py", "")
+
+    # --- Connectors ---
+    if connectors:
+        conn_dir = app_dir / "connectors"
+        conn_dir.mkdir(exist_ok=True)
+        created += _write_if_new(conn_dir / "__init__.py", "")
+        for conn in connectors:
+            created += _write_if_new(conn_dir / f"{conn}.py", _connector_template(conn))
+
+    # --- Shared services ---
+    shared_dir = app_dir / "shared"
+    shared_dir.mkdir(exist_ok=True)
+    created += _write_if_new(shared_dir / "__init__.py", "")
+
+    # --- Domain modules ---
+    module_names = []
+    for mod_spec in modules:
+        mod_name = mod_spec["name"]
+        module_names.append(mod_name)
+        mod_resources = mod_spec.get("resources", [])
+
+        for res_spec in mod_resources:
+            res_name = res_spec["name"]
+            res_type = res_spec.get("type", "resource")
+            fields = res_spec.get("fields", [])
+            signals = res_spec.get("signals", [])
+            relationships = res_spec.get("relationships", [])
+            default_actions = res_spec.get("default_actions", ["get", "list"])
+            tenant_scoped = res_spec.get("tenant_scoped", True)
+
+            if res_type == "workflow":
+                created += generate_workflow(
+                    name=res_name, module=mod_name,
+                    fields=fields, signals=signals or [{"name": "start", "create": True}],
+                    relationships=relationships, default_actions=default_actions,
+                    tenant_scoped=tenant_scoped,
+                    base_path=str(app_dir), test_path=str(test_dir),
+                )
+            else:
+                created += generate_resource(
+                    name=res_name, module=mod_name,
+                    fields=fields, relationships=relationships,
+                    default_actions=default_actions, tenant_scoped=tenant_scoped,
+                    base_path=str(app_dir), test_path=str(test_dir),
+                )
+
+    # --- Subscriptions ---
+    created += _write_if_new(app_dir / "subscriptions.py", _subscriptions_template(modules))
+
+    # --- App module ---
+    created += _write_if_new(app_dir / "app.py", _app_module_template(name, module_names))
+
+    # --- Web layer ---
+    web_dir.mkdir(parents=True, exist_ok=True)
+    created += _write_if_new(web_dir / "__init__.py", "")
+    created += _write_if_new(web_dir / "main.py", _web_main_template(name, snake_name, module_names, connectors or []))
+
+    # --- Alembic ---
+    alembic_dir = Path(base_path) / "alembic"
+    alembic_dir.mkdir(exist_ok=True)
+    (alembic_dir / "versions").mkdir(exist_ok=True)
+    created += _write_if_new(Path(base_path) / "alembic.ini", _alembic_ini_template(snake_name))
+    created += _write_if_new(alembic_dir / "env.py", _alembic_env_template(snake_name))
+
+    # --- Root test ---
+    test_dir.mkdir(parents=True, exist_ok=True)
+    created += _write_if_new(test_dir / "__init__.py", "")
+    created += _write_if_new(test_dir / "conftest.py", _test_conftest_template())
+
+    return created
+
+
+# ---------------------------------------------------------------------------
+# App-level templates
+# ---------------------------------------------------------------------------
+
+def _pyproject_template(name, snake_name):
+    return f'''[project]
+name = "{snake_name}"
+version = "0.1.0"
+description = "{name} - built on Ironbridge"
+requires-python = ">=3.12"
+dependencies = [
+    "ironbridge",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.0",
+    "alembic>=1.13.0",
+    "dbos>=2.0.0",
+    "pydantic>=2.0.0",
+    "cuid2>=2.0.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/{snake_name}", "src/{snake_name}_web"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+'''
+
+
+def _dockerfile_template():
+    return '''FROM python:3.13-slim
+
+WORKDIR /app
+COPY pyproject.toml .
+RUN pip install -e .
+COPY src/ src/
+COPY alembic/ alembic/
+COPY alembic.ini .
+
+CMD ["uvicorn", "lightwork_web.main:app", "--host", "0.0.0.0", "--port", "8000"]
+'''
+
+
+def _docker_compose_template(snake_name):
+    return f'''services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: {snake_name}
+      POSTGRES_PASSWORD: {snake_name}
+      POSTGRES_DB: {snake_name}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U {snake_name}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://{snake_name}:{snake_name}@postgres:5432/{snake_name}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      sh -c "alembic upgrade head && uvicorn {snake_name}_web.main:app --host 0.0.0.0 --port 8000"
+
+volumes:
+  postgres_data:
+'''
+
+
+def _env_example_template(connectors):
+    lines = [
+        f'DATABASE_URL=postgresql://app:app@localhost:5432/app',
+        '',
+    ]
+    connector_vars = {
+        "twilio": ["TWILIO_ACCOUNT_SID=", "TWILIO_AUTH_TOKEN=", "TWILIO_PHONE_NUMBER="],
+        "nylas": ["NYLAS_API_KEY=", "NYLAS_API_URI=https://api.nylas.com"],
+        "anthropic": ["ANTHROPIC_API_KEY="],
+        "alto": ["ALTO_CLIENT_ID=", "ALTO_CLIENT_SECRET="],
+        "stripe": ["STRIPE_SECRET_KEY=", "STRIPE_WEBHOOK_SECRET="],
+        "elevenlabs": ["ELEVENLABS_API_KEY="],
+        "google_maps": ["GOOGLE_MAPS_API_KEY="],
+        "resend": ["RESEND_API_KEY="],
+    }
+    for conn in connectors:
+        if conn in connector_vars:
+            lines.append(f"# {conn}")
+            lines.extend(connector_vars[conn])
+            lines.append("")
+    return "\n".join(lines)
+
+
+def _connector_template(name):
+    class_name = name.title().replace("_", "")
+    return f'''"""
+{class_name} connector. Plain client class, injected via providers.
+"""
+
+
+class {class_name}Client:
+    """TODO: implement {name} client."""
+
+    def __init__(self, **kwargs):
+        self.config = kwargs
+        # TODO: initialize client
+'''
+
+
+def _subscriptions_template(modules):
+    lines = [
+        '"""',
+        'Cross-domain subscriptions. All @on wiring lives here.',
+        'No domain imports another domain directly.',
+        '"""',
+        'from ironbridge.shared.framework import on',
+        '',
+    ]
+
+    for mod in modules:
+        mod_name = mod["name"]
+        snake_mod = _snake(mod_name)
+        resources = mod.get("resources", [])
+        for res in resources:
+            res_name = res["name"]
+            lines.append(f"from .{snake_mod} import {res_name}")
+
+    lines.append("")
+    lines.append("")
+    lines.append("# --- Cross-domain reactions ---")
+    lines.append("")
+
+    for mod in modules:
+        for res in mod.get("resources", []):
+            res_name = res["name"]
+            if res.get("type") == "workflow":
+                create_signal = None
+                for sig in res.get("signals", []):
+                    if sig.get("create"):
+                        create_signal = sig["name"]
+                        break
+                if create_signal:
+                    lines.append(f"# @on({res_name}, \"{create_signal}\")")
+                    lines.append(f"# async def on_{_snake(res_name)}_{create_signal}(resource, actor):")
+                    lines.append(f"#     pass  # TODO: cross-domain side effects")
+                    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _app_module_template(name, module_names):
+    imports = "\n".join(
+        f"from .{_snake(m)}.module import {m}Module" for m in module_names
+    )
+    modules_list = ", ".join(f"{m}Module" for m in module_names)
+
+    return f'''"""
+{name} app module. Groups all domain modules.
+"""
+from ironbridge.shared.framework import Module
+
+{imports}
+
+
+class {name}App(Module):
+    prefix = "/api"
+    modules = [{modules_list}]
+'''
+
+
+def _web_main_template(name, snake_name, module_names, connectors):
+    provider_lines = []
+    for conn in connectors:
+        class_name = conn.title().replace("_", "")
+        provider_lines.append(f'    # providers.register("{conn}", {class_name}Client(...))')
+
+    providers_block = "\n".join(provider_lines) if provider_lines else "    pass"
+
+    return f'''"""
+{name} web entry point.
+"""
+import os
+
+os.environ.setdefault("DATABASE_URL", "postgresql://{snake_name}:{snake_name}@localhost:5432/{snake_name}")
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from dbos import DBOS
+
+from ironbridge.shared.framework import (
+    Providers, set_providers, ResourceGraph,
+    init_modules, ready_modules, shutdown_modules,
+)
+from ironbridge.shared.framework.enforcement import PolicyDenied, GuardFailed
+from ironbridge.shared.framework.actor import Actor, Origin
+from ironbridge_web.derive.router import derive_router
+
+from {snake_name}.app import {name}App
+
+# Import subscriptions to register @on handlers
+import {snake_name}.subscriptions  # noqa: F401
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="{name}", version="0.1.0")
+
+    # --- Error handlers ---
+    @app.exception_handler(PolicyDenied)
+    async def on_policy_denied(request: Request, exc: PolicyDenied):
+        return JSONResponse(403, {{"error": "forbidden", "message": str(exc), "policy": exc.policy_name}})
+
+    @app.exception_handler(GuardFailed)
+    async def on_guard_failed(request: Request, exc: GuardFailed):
+        return JSONResponse(409, {{"error": "conflict", "message": str(exc), "guard": exc.guard_name}})
+
+    @app.exception_handler(ValueError)
+    async def on_value_error(request: Request, exc: ValueError):
+        return JSONResponse(400, {{"error": "bad_request", "message": str(exc)}})
+
+    # --- Actor middleware ---
+    @app.middleware("http")
+    async def actor_middleware(request: Request, call_next):
+        # TODO: replace with JWT/session auth
+        request.state.actor = Actor(
+            id=request.headers.get("X-User-Id", "anonymous"),
+            tenant_id=request.headers.get("X-Tenant-Id", "default"),
+            role=request.headers.get("X-User-Role", "viewer"),
+            origin=Origin(channel="web_dashboard"),
+        )
+        return await call_next(request)
+
+    # --- Health ---
+    @app.get("/health")
+    def health():
+        return {{"status": "ok"}}
+
+    # --- Providers ---
+    providers = Providers()
+{providers_block}
+    set_providers(providers)
+
+    # --- DBOS ---
+    DBOS(config={{"name": "{snake_name}", "system_database_url": DATABASE_URL}})
+    DBOS.launch()
+
+    # --- Initialize modules ---
+    modules = {name}App.modules
+    init_modules(modules, providers)
+
+    # --- Graph ---
+    graph = ResourceGraph()
+    graph.build()
+    errors = graph.validate()
+    if errors:
+        print(f"Graph validation errors: {{errors}}")
+
+    # --- Mount routes ---
+    for mod_cls in modules:
+        for resource in mod_cls.all_resources():
+            prefix = f"/api/{{mod_cls.prefix}}" if mod_cls.prefix else "/api"
+            app.include_router(derive_router(resource), prefix=prefix)
+
+    # --- Ready ---
+    ready_modules(modules)
+
+    # --- Shutdown ---
+    @app.on_event("shutdown")
+    def shutdown():
+        shutdown_modules(modules)
+
+    return app
+
+
+if __name__ == "__main__":
+    import uvicorn
+    app = create_app()
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+'''
+
+
+def _alembic_ini_template(snake_name):
+    return f'''[alembic]
+script_location = alembic
+sqlalchemy.url = postgresql://{snake_name}:{snake_name}@localhost:5432/{snake_name}
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+'''
+
+
+def _alembic_env_template(snake_name):
+    return f'''from logging.config import fileConfig
+from sqlalchemy import engine_from_config, pool
+from alembic import context
+from ironbridge.shared.framework.resource import Base
+
+config = context.config
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+def run_migrations_online():
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {{}}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+
+run_migrations_online()
+'''
+
+
+def _test_conftest_template():
+    return '''"""Shared test fixtures."""
+
+import pytest
+from ironbridge.shared.framework import InMemoryRepository
+
+
+@pytest.fixture(autouse=True)
+def clean_memory_stores():
+    InMemoryRepository.clear_all()
+    yield
+    InMemoryRepository.clear_all()
+'''
+
+
+# ---------------------------------------------------------------------------
+# Write helper
+# ---------------------------------------------------------------------------
+
+def _write_if_new(path: Path, content: str) -> list[str]:
+    """Write file only if it doesn't exist. Returns list of created paths."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(content)
+        return [str(path)]
+    return []

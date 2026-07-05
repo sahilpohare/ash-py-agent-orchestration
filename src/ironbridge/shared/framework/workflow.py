@@ -39,18 +39,10 @@ from .signal import Signal, SignalDef, get_signal_transport
 # ---------------------------------------------------------------------------
 
 def workflow(fn: Callable) -> Callable:
-    """Mark a function as a durable workflow. DBOS wraps it at derive time."""
+    """Mark a function as a durable workflow. DBOS wraps it at derive time.
+    Does not wrap - just marks. Preserves async nature."""
     fn._is_workflow = True
-
-    @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        return fn(*args, **kwargs)
-
-    wrapper._is_workflow = True
-    for attr in ("__action__", "_policies", "_guards"):
-        if hasattr(fn, attr):
-            setattr(wrapper, attr, getattr(fn, attr))
-    return wrapper
+    return fn
 
 
 def is_workflow_fn(fn: Any) -> bool:
@@ -325,23 +317,28 @@ class Workflow:
     """
     Mixin that marks a class as workflow-capable.
 
-    Enables Signal declarations and on_ handler linking.
-    Use with Resource for stateful workflows.
-    Use standalone for pure orchestration.
+    Signals declare their handlers explicitly:
+        start = Signal(kind=ActionKind.CREATE, handler=handle_start)
+        # or
+        @start.handler
+        async def handle_start(self, ctx): ...
+
+    No naming conventions. No auto-discovery.
     """
 
     __abstract__ = True
     __signals__: ClassVar[dict[str, SignalDef]]
-    __handlers__: ClassVar[dict[str, str]]
+    __handlers__: ClassVar[dict[str, Callable]]  # signal_name -> handler function
     __workflow_entry__: ClassVar[str | None]
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
 
         signals: dict[str, SignalDef] = {}
-        handlers: dict[str, str] = {}
+        handlers: dict[str, Callable] = {}
         workflow_entry: str | None = None
 
+        # Collect Signal descriptors
         for attr_name in dir(cls):
             if attr_name.startswith("_"):
                 continue
@@ -349,28 +346,46 @@ class Workflow:
             if isinstance(attr, Signal):
                 signal_def = attr.to_def(attr_name, cls)
                 signals[attr_name] = signal_def
+
                 transport = get_signal_transport()
                 if transport:
                     signal_def._send_fn = transport
 
+                # Resolve handler: explicit first, then on_ convention
+                if signal_def._handler_fn is not None:
+                    # Explicit handler (via handler= or @signal.handler)
+                    handlers[attr_name] = signal_def._handler_fn
+                else:
+                    # Convention fallback: on_{signal_name}
+                    convention_name = f"on_{attr_name}"
+                    convention_fn = getattr(cls, convention_name, None)
+                    if convention_fn is not None and callable(convention_fn):
+                        signal_def._handler_fn = convention_fn
+                        handlers[attr_name] = convention_fn
+
+        # Determine entry handler (CREATE signal)
         from .actions import ActionKind
-        for signal_name in signals:
-            handler_name = f"on_{signal_name}"
-            if hasattr(cls, handler_name):
-                handlers[signal_name] = handler_name
-                if signals[signal_name].kind == ActionKind.CREATE:
-                    workflow_entry = handler_name
+        for signal_name, signal_def in signals.items():
+            if signal_def.kind == ActionKind.CREATE and signal_def._handler_fn is not None:
+                workflow_entry = signal_name
 
         cls.__signals__ = signals
         cls.__handlers__ = handlers
         cls.__workflow_entry__ = workflow_entry
 
+        # Validate at import time (skip abstract classes)
+        if signals and not bool(getattr(cls, "__dict__", {}).get("__abstract__")):
+            from .validation import validate_signals_at_import
+            validate_signals_at_import(cls)
+
     @classmethod
-    def get_handler(cls, signal_name: str) -> str | None:
+    def get_handler(cls, signal_name: str) -> Callable | None:
+        """Get the handler function for a signal."""
         return cls.__handlers__.get(signal_name)
 
     @classmethod
     def get_entry_handler(cls) -> str | None:
+        """Get the entry signal name (CREATE signal)."""
         return getattr(cls, "__workflow_entry__", None)
 
     @classmethod

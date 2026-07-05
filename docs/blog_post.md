@@ -1,0 +1,337 @@
+# An Ash-Inspired DDD Framework for Python: Derive Everything from the Domain Model
+
+I've been building **PingerAgents** — a multitenant AI agent orchestration platform. Along the way I ended up writing something that felt worth writing up on its own: a domain-driven design framework for Python that derives persistence, durable execution handlers, and tenant isolation from a single resource class.
+
+It's inspired by Elixir's [Ash framework](https://ash-hq.org). This is a writeup of what it is, how it works, and the mistakes made building it.
+
+---
+
+## The Problem with Backend Glue
+
+Most backend code isn't business logic. It's wiring. You write a domain object, then you write:
+
+- A SQLAlchemy model to persist it
+- A repository with upsert semantics
+- HTTP handlers or message queue consumers to receive commands
+- Tenant filtering on every query
+- Retry logic, idempotency checks, concurrency controls
+
+Then you repeat this for every entity. The business logic — the part that actually matters — is a thin layer inside a thick shell of infrastructure glue.
+
+The observation that drives this framework: if the domain model is expressive enough, all of that can be derived.
+
+---
+
+## The Framework
+
+### Resources
+
+A `Resource` subclass is simultaneously a SQLAlchemy model, a upsert repository, and a Restate VirtualObject. You write one class:
+
+```python
+from ironbridge.shared.framework import Resource, ActionKind, action
+from ironbridge.shared.framework.effects import ActionContext
+
+class Widget(Resource):
+    class Meta:
+        tenant_scoped  = True   # inject tenant_id, enforce via Postgres RLS
+        restate_object = True   # derive a Restate VirtualObject
+
+    __tablename__ = "widgets"
+
+    id         : Mapped[str]      = mapped_column(String, primary_key=True, default=_cuid)
+    name       : Mapped[str]      = mapped_column(String, nullable=False)
+    status     : Mapped[str]      = mapped_column(String, default="ACTIVE")
+    created_at : Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    @action(kind=ActionKind.CREATE)
+    def create(self, name: str) -> "Widget":
+        self.name = name
+        return self
+
+    @action(kind=ActionKind.UPDATE)
+    def deactivate(self) -> "Widget":
+        if self.status == "INACTIVE":
+            raise ValueError("Already inactive")
+        self.status = "INACTIVE"
+        return self
+
+    @action(kind=ActionKind.READ)
+    def get(self) -> WidgetView:
+        return WidgetView(id=self.id, name=self.name, status=self.status)
+```
+
+From this, the framework derives at startup:
+
+| Artifact | Source |
+|---|---|
+| SQLAlchemy ORM model | `Mapped[]` column declarations — standard SQLAlchemy, no custom wrappers |
+| `tenant_id` column + Postgres RLS policy | `Meta.tenant_scoped = True` |
+| Upsert repository | ORM model |
+| Restate VirtualObject + one handler per action | `Meta.restate_object = True` + `@action` |
+| Exclusive vs shared handler concurrency | `ActionKind` |
+| Effect execution after DB write | `ActionContext` |
+
+No code generation. No separate schema files. One class, everything derived at import time.
+
+### ResourceMeta: the metaclass
+
+`ResourceMeta` extends SQLAlchemy's `DeclarativeBase` metaclass and runs at class definition time. It does three things:
+
+1. **Injects tenancy columns.** If `Meta.tenant_scoped = True`, it injects `tenant_id` (or whatever `Meta.tenancy_key` is) as a `mapped_column` with `server_default = current_setting('app.tenant_id', true)`. Domain code never declares this column.
+
+2. **Collects actions.** It scans the class namespace for methods decorated with `@action` and builds `cls.__actions__: dict[str, ActionMeta]`. Inherited actions are included; methods that shadow parent actions without `@action` are excluded.
+
+3. **Registers the class globally.** The global resource registry maps class names to classes so the derive layer can find them at startup without circular imports.
+
+```python
+class ResourceMeta(type(Base)):
+    def __new__(mcs, name, bases, namespace):
+        # collect @action methods into cls.__actions__
+        # parse cls.Meta into cls.__meta__
+        # inject tenant_id column if tenant_scoped
+        # register in global registry
+        ...
+```
+
+### ActionKind drives DB and concurrency behaviour
+
+The action kind tells the framework what to do with the return value and how to configure the Restate handler:
+
+| Kind | DB op | Restate concurrency |
+|---|---|---|
+| `CREATE` | INSERT + auto-save returned resource | exclusive |
+| `UPDATE` | UPSERT + auto-save returned resource | exclusive |
+| `DESTROY` | DELETE by key | exclusive |
+| `ACTION` | domain controls all writes via ActionContext | exclusive |
+| `READ` | no write | shared (concurrent) |
+| `STREAM` | no write | shared (concurrent) |
+
+`CREATE` and `UPDATE` auto-save the returned `Resource` — the framework calls `repo.save(result)`. `ACTION` hands full control to domain code; the framework only executes the collected effects after the DB write. `READ` and `STREAM` get Restate shared handlers so concurrent reads don't block each other.
+
+The action body rules are strict: no I/O, no raw SQL, no external calls. Validate, mutate, return. The framework handles persistence.
+
+```python
+# Good
+@action(kind=ActionKind.UPDATE)
+def deactivate(self) -> "Widget":
+    if self.status == "INACTIVE":
+        raise ValueError("Already inactive")
+    self.status = "INACTIVE"
+    return self
+
+# Bad — I/O in action body
+@action(kind=ActionKind.UPDATE)
+def deactivate(self) -> "Widget":
+    db.execute(...)       # don't — framework handles persistence
+    requests.post(...)    # don't — use ActionContext for side effects
+    return self
+```
+
+### Effects are data, not calls
+
+Domain code never imports Restate. Side effects are declared via `ActionContext`, a plain Python object passed into `ACTION` handlers:
+
+```python
+@action(kind=ActionKind.ACTION)
+def add_message(self, action_ctx: ActionContext, content: dict, participant_id: str, ...) -> Message:
+    msg = Message(
+        id=_cuid(),
+        thread_id=self.id,
+        content=content,
+        participant_id=participant_id,
+    )
+
+    # If this is a human message, start an agent run
+    if participant_type == "HUMAN":
+        run_id = _cuid()
+        action_ctx.send_workflow("AgentRun", key=run_id, arg={
+            "run_id": run_id,
+            "thread_id": self.id,
+            "tenant_id": self.tenant_id,
+        })
+
+    # Fan out to all channels bound to this thread
+    for channel_id in resolve_channels_for_thread(self.id, self.tenant_id):
+        action_ctx.send_after(
+            "ChannelDelivery", "deliver", key=channel_id,
+            factory=lambda result, cid=channel_id: {
+                "channel_id": cid,
+                "message": {"position": result["position"], "content": content, ...},
+            },
+        )
+
+    return msg
+```
+
+`ActionContext` has three methods:
+
+- `send(service, handler, key, arg)` — fire-and-forget to a VirtualObject handler
+- `send_after(service, handler, key, factory)` — fire-and-forget, but arg built from the action result after the DB write
+- `send_workflow(service, key, arg, handler)` — start or signal a Restate Workflow
+
+**`send_after` is the subtle one.** The message `position` field is assigned by the framework's position counter after `ctx.run()` — the domain code can't know it when constructing the effect. `send_after` takes a factory function that receives the serialized result dict after `ctx.run()` returns. The derive layer (`restate.py`) calls `factory(result)` generically — it contains zero knowledge of `ChannelDelivery`, position fields, or why they matter.
+
+To make this concrete, here's what the derive layer does after every ACTION handler:
+
+```python
+# Inside _attach_handler, after ctx.run() returns the serialized result:
+result = await ctx.run(action_name, _run)
+
+# Update position counter in Restate state (for add_message-style actions)
+if is_positional and next_pos is not None:
+    ctx.set("position", next_pos)
+
+# Execute effects collected by ActionContext during _run
+if action_ctx:
+    for effect in action_ctx.effects:
+        if isinstance(effect, DeferredSendEffect):
+            arg = effect.factory(result)   # factory receives the result here
+            ctx.generic_send(effect.service, effect.handler, json.dumps(arg).encode(), key=effect.key)
+        elif isinstance(effect, SendEffect):
+            ctx.generic_send(effect.service, effect.handler, json.dumps(effect.arg).encode(), key=effect.key)
+        elif isinstance(effect, WorkflowEffect):
+            ctx.workflow_send(handler_fn, key=effect.key, arg=arg)
+```
+
+`result` is the dict that came back from `ctx.run()` — which includes `position` because the framework assigned it inside `_run` before returning. The factory sees the fully-populated result. The derive layer calls `factory(result)` generically; it doesn't know what fields the factory reads.
+
+Effects are data. The derive layer executes them. Domain code is insulated from infrastructure.
+
+### derive_virtual_object: fully generic
+
+`derive_virtual_object(resource_cls)` reads `cls.__actions__` and `cls.__meta__` and generates a Restate VirtualObject with correct handler concurrency, position counters, idempotency, and effect execution. It contains no domain knowledge:
+
+```python
+def derive_virtual_object(resource_cls: type[Resource]) -> restate.VirtualObject:
+    obj = restate.VirtualObject(resource_cls.__name__)
+
+    for action_name, action_meta in resource_cls.__actions__.items():
+        _attach_handler(obj, resource_cls, action_name, action_meta)
+
+    # If resource has add_message, inject queue management handlers
+    if "add_message" in resource_cls.__actions__:
+        _attach_queue_handlers(obj, resource_cls.__name__)
+
+    return obj
+```
+
+Each generated handler:
+1. Extracts auth/tenant from the request
+2. Recovers the position counter if needed (for `add_message`-style actions)
+3. Calls `ctx.run(action_name, _run)` where `_run` opens a tenant session, loads the resource by key, calls the action method, and saves if needed
+4. Updates the position counter in Restate state
+5. Executes all collected effects via `_execute_effects`
+
+The `_run` callback is a pure function — no Restate operations inside it, no HTTP calls. Everything that touches Restate happens outside the callback.
+
+### Tenant isolation is structural
+
+`tenant_scoped = True` triggers a three-layer enforcement:
+
+**Layer 1 — Column injection.** `ResourceMeta` injects `tenant_id` with `server_default = current_setting('app.tenant_id', true)`. If application code forgets to set it, Postgres fills it from the session variable.
+
+**Layer 2 — Session variable.** `tenant_session("tenant-abc")` is a context manager that sets `SET LOCAL app.tenant_id = :tid` on the connection before any query.
+
+**Layer 3 — RLS policy.** Alembic migration creates `CREATE POLICY tenant_isolation ON widgets USING (tenant_id = current_setting('app.tenant_id', true))`.
+
+The consequence: a missing `WHERE tenant_id = ?` clause in application code returns zero rows, not all rows. Bugs fail closed. There is no way to accidentally leak cross-tenant data through a forgotten filter.
+
+```python
+with tenant_session("tenant-abc") as db:
+    repo = SqlAlchemyRepository(db, Widget)
+    widgets = repo.list()   # no WHERE clause — RLS filters automatically
+```
+
+### All writes are upserts
+
+`SqlAlchemyRepository.save()` always issues `INSERT ... ON CONFLICT DO UPDATE`. This is not a stylistic preference — it's required for correctness with durable execution.
+
+When Restate replays a journaled step after a crash, the `ctx.run()` callback re-executes. A bare `INSERT` raises a duplicate-key error on replay. An upsert is idempotent.
+
+For some resources the conflict target isn't the primary key. `Message` has a natural key `(thread_id, idempotency_key)` — two messages in the same thread with the same idempotency key are the same message. After a Restate purge, workflows replay with new generated message IDs but the same idempotency keys. `ON CONFLICT (id) DO UPDATE` would succeed (new ID, no conflict) and then violate the unique constraint. The correct target is the natural key with `DO NOTHING`:
+
+```python
+class Message(Resource):
+    class Meta:
+        conflict_columns = ("thread_id", "idempotency_key")
+        conflict_action  = "nothing"
+```
+
+`ResourceMeta` parses these and the repository uses them automatically.
+
+---
+
+## What I Tried First and Deleted
+
+**Custom field types.** Early version had `fields.py` with `CuidField`, `StringField`, `DateTimeField` and a separate `derive/orm.py` that emitted SQLAlchemy models from those field definitions. It was reimplementing SQLAlchemy, badly. Two files, ~300 lines, providing worse type safety than native `Mapped[]`. Deleted both. `Resource` now directly inherits from `DeclarativeBase`.
+
+**Content hash idempotency keys.** Tried auto-generating idempotency keys from a hash of message content to remove them from the domain API. Problem: two different senders can produce identical content. A hash-based key would deduplicate messages from different senders — wrong semantics. Reverted to caller-supplied keys.
+
+**Application-layer tenant filters.** Started with `filter_by(tenant_id=...)` in every repository method. Moved to RLS. The difference: application filters fail open (missing filter = all rows); RLS fails closed (missing `SET LOCAL` = empty session variable = zero rows). One enforcement point, structurally correct.
+
+**Single ConversationWorkflow per thread.** Tried making each thread a Restate Workflow that persisted conversation state in Restate's state store. Blocked by a Restate SDK bug: `WorkflowSharedContext.get/set` fails when the handler input is a Pydantic model — the SDK tries to serialize the input during journal bookkeeping and fails with `not JSON serializable`. Reverted to Thread VirtualObject (for message ordering) + AgentRun Workflow (for agent execution).
+
+---
+
+## The Bugs That Taught Me Things
+
+**SQLAlchemy relationships inflate the journal.** `_serialize()` originally walked the full object graph including relationship collections. A `Thread` with 200 messages would serialize all 200 messages into the journal entry for every single `add_message` call. This caused Pusher 413 errors (payload too large) and made journal entries balloon in size. Fix: skip relationship collections in `_serialize()` entirely. Handler return values don't need related objects — they're not part of the action contract.
+
+**`ON CONFLICT (id)` breaks after Restate purge.** After clearing Restate state, workflows replay. If the replay generates a new message ID but the same idempotency key, `ON CONFLICT (id) DO UPDATE` has no conflict on the new ID — INSERT proceeds, then hits the `UNIQUE(thread_id, idempotency_key)` constraint. Fix: `ON CONFLICT (thread_id, idempotency_key) DO NOTHING`. If the DB has the message already (it's the source of truth), skip silently.
+
+**`httpx.post` inside a workflow handler deadlocks.** Early code wrote error messages by calling `httpx.post` to the Restate ingress from inside the workflow handler. This caused a deadlock: the workflow was executing inside Restate's handler loop, and synchronously calling back into Restate ingress blocked. `_run_done` never fired, thread queues blocked permanently. Fix: all sends from workflow handlers go through `ctx.generic_send` — fire-and-forget, non-blocking, journaled.
+
+**Dead VirtualObject state after Restate purge.** After `podman compose down -v`, Restate state is wiped but the Thread VirtualObject's `active_run_id` was set in its state before the purge. `_run_done` will never fire because the workflow no longer exists. Without a liveness check, the thread queue blocks forever on every purge. Fix: `_enqueue_run` calls `ctx.workflow_call(status_fn, key=active_run_id)` before assuming a run is live. If status is not `"running"`, clear state and fire immediately.
+
+---
+
+## The Agentic Layer
+
+The framework's primary value is as a DDD toolkit — any Python service combining durable execution with a relational database can use it. But for Ironbridge specifically, the framework underpins an agentic execution layer.
+
+The agent contract is minimal:
+
+```python
+class BaseAgent(ABC):
+    @abstractmethod
+    async def run(self, ctx: AgentContext) -> None: ...
+```
+
+`AgentContext` wraps Restate's WorkflowContext and exposes domain-level primitives: durable steps, history fetch, message write, human-in-the-loop suspension. Agents import nothing from Restate or SQLAlchemy.
+
+```python
+class WeatherAgent(BaseAgent):
+    async def run(self, ctx: AgentContext) -> None:
+        history = await ctx.step("fetch_history", ctx.get_history)
+        response = await ctx.step("llm_call_0", lambda: call_llm(history))
+        ctx.write_message({"version": 1, "parts": [{"type": "text", "text": response}]})
+
+agent_registry.register("weather", WeatherAgent)
+```
+
+Each `ctx.step()` is journaled. Crash between steps — replay picks up where it left off. Human-in-the-loop is HITL named promises (the agent suspends, a message appears in the thread, the human replies, the promise resolves, the agent resumes). Cancellation is a durable promise peeked before each step — when a new user message arrives, the active run is cancelled at the next step boundary.
+
+The framework handles all of this. The agent is just domain logic.
+
+---
+
+## Guiding Principles
+
+These held up over 45 architectural decisions:
+
+1. **Postgres is the source of truth.** Restate journals execution intent, not state. All reads go to Postgres.
+2. **Tenant isolation is structural.** RLS at the DB layer. A missing filter returns zero rows.
+3. **Domain has no infrastructure imports.** Effects are data declared via `ActionContext`. Infrastructure executes them.
+4. **All writes are upserts.** Durable execution replays callbacks. Idempotency must be structural, not optional.
+5. **Effects execute after the DB write, durably.** Postgres and Restate share no distributed transaction manager — true atomicity across both is impossible without a 2PC or outbox pattern. What the framework does instead: effects are fired inside the Restate handler *after* `ctx.run()` returns, and those sends are themselves journaled by Restate. If the process crashes between the DB write and the send, Restate replays the handler — `ctx.run()` returns its cached result (no double-write), and the sends fire. The DB write is the source of truth; the effect delivery is guaranteed by Restate's replay. The window of inconsistency is a process crash between `ctx.run()` completing and the next Restate journal entry — which Restate closes by design.
+
+---
+
+## Stack
+
+Python, FastAPI, [Restate](https://restate.dev), Postgres (RLS), Alembic, Hypercorn (HTTP/2 required for Restate), Podman Compose.
+
+The framework layer (`shared/framework/` and `shared/derive/`) has no domain knowledge. The platform layer (`platform/`) has no Restate imports except through the framework. Concrete agents and adapters (`services/`) have neither.
+
+45 ADRs in `docs/decisions.md` for anyone who wants to go deeper.

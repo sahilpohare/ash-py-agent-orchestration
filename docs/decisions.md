@@ -990,3 +990,112 @@ If the job is no longer in `quote_approval` state when the approval signal arriv
 **Combined with `with` lifecycle:** Guards check resource state. `with` manages the receive channel. Both protect against stale signals, at different levels:
 - Guards: "is this resource in the right state for this signal?" (resource-level)
 - `with`: "is this workflow currently waiting for this signal?" (workflow-level)
+
+---
+
+## 74. Design principle: Anything, not Everything
+
+**Decision:** The framework provides primitives (Resource, Workflow, Signal, Policy, Guard, Extension, Step). It does NOT provide tenancy, threads, auth, billing, notifications. Those are patterns copied via `ironbridge add` or built by the domain.
+
+**Reasoning:** Follows Ash's core principle. A framework that does everything constrains applications. A framework that enables anything unlocks them. The `ironbridge add` (shadcn-style) gives starting points without lock-in.
+
+---
+
+## 75. Design principle: Configuration over Convention
+
+**Decision:** Explicit configuration is preferred. Where conventions exist (e.g., `on_{signal_name}` handler matching), they are always overridable and validated at import time.
+
+```python
+# Convention (works, overridable):
+async def on_start(self, ctx): ...
+
+# Explicit (preferred):
+@start.handler
+async def handle_start(self, ctx): ...
+
+# Or:
+start = Signal(handler=handle_start)
+```
+
+`belongs_to`, `has_many` require explicit `key=`. No inferred FK names.
+
+**Reasoning:** Implicit conventions hide behavior and create silent failures. Explicit configuration is discoverable and maintainable.
+
+---
+
+## 76. Design principle: The execution backend is pluggable
+
+**Decision:** The framework defines `@workflow`, `@step`, `ctx.receive()`, `ctx.save()`, `Signal.send()`. The derive layer implements them. DBOS is the current backend but the domain code never imports it.
+
+```python
+# Framework primitive (domain code):
+@step(retries=5, backoff=2.0, interval=120)
+async def send_email(grant_id: str, body: str): ...
+
+# DBOS derive layer wraps it:
+# @DBOS.step(retries_allowed=True, max_attempts=5, ...)
+
+# Temporal derive layer would wrap it:
+# @activity.defn, RetryPolicy(max_attempts=5, ...)
+
+# No derive layer: runs as plain function.
+```
+
+**Reasoning:** Backend lock-in is a design failure. The domain should be portable across execution engines. The derive layer is the only integration point.
+
+---
+
+## 77. Signal handler binding: explicit or convention, validated at import time
+
+**Decision:** Signals bind handlers via:
+1. `@signal.handler` decorator (explicit)
+2. `Signal(handler=fn)` argument (explicit)
+3. `on_{signal_name}` method (convention fallback)
+
+Explicit takes precedence. Convention is a fallback. Both are validated at import time:
+- Handler must be async
+- Handler must accept (self, ctx, ...)
+- Route collisions between signals/actions raise ConfigurationError
+
+Signals without handlers are valid (awaited via `ctx.receive()`). The framework statically checks if unhandled signals are referenced in handler source code and warns if not.
+
+---
+
+## 78. Import-time validation: fail fast on misconfiguration
+
+**Decision:** Configuration errors are caught at import time (class creation), not at request time. The app never starts if resources are misconfigured.
+
+**Errors (block import):**
+- Handler not async
+- Handler missing ctx parameter
+- Route collision (signal vs signal, signal vs action)
+- `belongs_to` / `has_many` missing `key=`
+
+**Warnings (printed to stderr, don't block):**
+- Signal declared but never handled or awaited
+
+**CLI validation (`ironbridge validate`):**
+- Imports all resources, builds graph, checks cross-resource relationships
+- Unresolved string references, missing FK fields, through resources
+
+---
+
+## 79. `@step` for durable retriable functions
+
+**Decision:** `@step(retries=5, backoff=2.0, interval=120)` marks a function as a durable, retriable unit of work. The framework primitive. The execution backend wraps it.
+
+Without backend: runs as a normal function call. With DBOS: exactly-once, journaled, auto-retry. With Temporal: activity with retry policy.
+
+**Reasoning:** Retry/backoff logic was ~600 LOC in Labs v1 (custom per feature: reply retry, CRM repush, stalled enquiry sweep). One decorator with config replaces all of it. Zero custom retry code.
+
+---
+
+## 80. `ironbridge new` and `ironbridge add`: shadcn-style project scaffolding
+
+**Decision:** `ironbridge new MyApp` creates a runnable project. `ironbridge add tenancy` copies pattern files into the project. The developer owns the copied code.
+
+**`new` creates:** pyproject.toml, docker-compose.yml, .env, alembic, app.py, main.py, subscriptions.py, conftest.py, README.md + the ironbridge framework source.
+
+**`add` copies:** Pre-built patterns (tenancy, threads, auth, soft-delete, timestamps) with `{{app_name}}` variable substitution. Not a package dependency. Actual files you modify.
+
+**Reasoning:** Follows principle #1 (Anything, not Everything). The framework doesn't prescribe tenancy or auth. It provides starting points you customize. Like shadcn/ui copies component source into your project.
