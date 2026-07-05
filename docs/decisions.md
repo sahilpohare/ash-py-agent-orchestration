@@ -441,3 +441,552 @@ A running log of decisions made, why, and what changed.
 **Reasoning:** Every adapter needs the same DB operations to provision its channel record and manage thread bindings. Duplicating this logic per adapter was error-prone.
 
 **Consequence:** Adapters call `self.get_or_create_channel(tenant_id)` on first use (idempotent). `new_thread` creates a Restate Thread and binds it in one call. `bind_thread` uses `UNIQUE(thread_id, channel_id)` — safe to call on every inbound request.
+
+---
+
+## 46. Actor carries full flow context, not just identity
+
+**Decision:** `Actor` is a frozen dataclass with identity (id, tenant_id, role, scopes), origin (channel, source_type, source_id, ip, idempotency_key), and a chain (`on_behalf_of: Actor | None`). It threads through the entire execution: policies, guards, agent runs, channel deliveries, audit logs.
+
+**Reasoning:** A webhook handler creates the initial Actor. When it kicks off an agent, the agent gets a derived Actor (`actor.as_agent("scheduling")`) whose `on_behalf_of` points back to the webhook Actor. The chain lets any point in the flow answer: "Who started this? Through what channel? On what resource?"
+
+**Consequence:** `actor.initiator` walks the chain to the root. Policies like `initiator_is("admin")` check the human behind an agent action, not the agent itself. `actor.to_dict()` serializes the full chain for audit logs.
+
+**Constructors:** `from_request()` (JWT/session), `from_webhook()` (Twilio/Nylas/Stripe), `from_cron()` (scheduled jobs). Derivation: `as_agent()`, `as_system()`, `with_source()`.
+
+---
+
+## 47. Policies and guards are separate from actions
+
+**Decision:** Policies (authorization: who) and guards (preconditions: what state) are attached to actions via `@policy()` and `@guard()` decorators. They are pure functions with no DB or I/O. Enforcement runs policies first, then guards.
+
+**Reasoning:** In Ash, policies and actions are orthogonal. We follow the same principle. An action body contains only domain logic. Authorization and precondition checks are declarative, composable, and testable in isolation.
+
+**Consequence:**
+- `@policy(role_is("admin", "operator"))` -- checked before the action runs. DENY -> 403.
+- `@guard(in_state("quote_approval"), field_set("quote_amount"))` -- checked after policies pass. Fail -> 409.
+- `enforce(actor, resource, action_fn)` runs both. `can()` returns bool without raising.
+- Built-in policies: `role_is`, `same_tenant`, `system_only`, `has_scope`, `anyone`, `initiator_is`.
+- Built-in guards: `in_state`, `not_in_state`, `not_deleted`, `field_set`, `field_equals`, `field_true`, `custom`.
+
+---
+
+## 48. Default actions via default_action() and Meta.default_actions
+
+**Decision:** Resources can get standard CRUD actions without writing the body. Two mechanisms:
+
+1. `Meta.default_actions` -- `True` (all five), `["create", "get", "list"]` (pick), or `False` (none).
+2. `default_action(kind, policies=..., guards=...)` -- explicit declaration with custom policies/guards.
+
+Both can coexist. Explicit `default_action()` declarations override Meta defaults.
+
+**Default policies for Meta-injected actions:**
+- Writes (create/update/delete): `role_is("admin", "operator", "system")`. Plus `same_tenant()` if tenant_scoped.
+- Reads (get/list): `anyone()`. Plus `same_tenant()` if tenant_scoped.
+- Update/delete also get `not_deleted()` guard.
+
+**Reasoning:** Most resources need the same CRUD. Writing five trivial action bodies per resource is boilerplate. But the authorization profile differs: some resources are admin-only to create, some are system-only to delete. `default_action()` lets you customize per-action without rewriting the body.
+
+**Override:** Defining a method with the same name in the Resource class shadows the default. The metaclass skips injection if the name already exists in the namespace.
+
+---
+
+## 49. Three-layer package structure: ironbridge / ironbridge_web / services
+
+**Decision:** One repo, three packages with clear dependency direction:
+- `ironbridge` -- framework primitives (Resource, Actor, policies, guards, enforcement, Thread, Channel, Agent). No HTTP, no business logic.
+- `ironbridge_web` -- web layer (FastAPI router derivation, middleware, actor resolution, error handlers). Knows FastAPI but not the business domain.
+- `services` -- domain layer (Call, Enquiry, MaintenanceJob, Lead, Viewing, channel adapters, PMS connectors). Imports from both.
+
+**Dependency direction:** `services/ -> ironbridge_web/ -> ironbridge/`. `ironbridge/` imports from nothing external.
+
+**Reasoning:** The framework should be testable without FastAPI. The web layer should be reusable across domains. The domain should be swappable without touching infrastructure.
+
+---
+
+## 50. Derive layer generates FastAPI routes from Resource actions
+
+**Decision:** `derive_router(ResourceCls)` in `ironbridge_web` reads a Resource's `__actions__` and generates a FastAPI `APIRouter` with one route per action. Route shape follows REST conventions:
+
+| ActionKind | Route |
+|---|---|
+| CREATE | `POST /{resources}` |
+| READ (get) | `GET /{resources}/{id}` |
+| READ (list) | `GET /{resources}` |
+| READ (named) | `GET /{resources}/{id}/{action_name}` |
+| UPDATE (update) | `PATCH /{resources}/{id}` |
+| UPDATE (named) | `POST /{resources}/{id}/{action_name}` |
+| DESTROY | `DELETE /{resources}/{id}` |
+| ACTION | `POST /{resources}/{id}/{action_name}` |
+
+Each generated handler: resolves Actor, loads resource from DB, calls `enforce()`, invokes the action, saves the result.
+
+**Reasoning:** Hand-writing route handlers per resource is the bulk of boilerplate in Labs v1. Deriving them eliminates it while keeping full control via policies, guards, and custom actions.
+
+**No Restate dependency.** This is a direct FastAPI derive, not a Restate proxy. Restate derivation (`derive/restate.py`) remains a separate, optional path.
+
+---
+
+## 51. Workflow extends Resource with Signals and durable handlers
+
+**Decision:** Two base classes: `Resource` (CRUD, sync) and `Workflow(Resource)` (signals, async, durable). A Workflow IS a Resource that also accepts Signals and has `on_` handlers.
+
+**Resource:** Fields, relationships, actions (sync request/response), policies, guards. Pure data with behavior. No external I/O in action bodies.
+
+**Workflow:** Everything Resource has, plus Signal declarations and `on_{signal_name}` async handlers. Handlers receive a `WorkflowContext` with `save()`, `receive()`, `sleep()`, `emit()`. Handlers delegate to domain services for business logic.
+
+**Consequence:** The test is simple. Does it have a state machine or long-running process? Workflow. Is it just data you read and write? Resource.
+
+---
+
+## 52. Signals are not Actions
+
+**Decision:** Actions are synchronous request/response (caller waits, gets result, 200). Signals are asynchronous fire-and-forget (caller gets 202, workflow handles it when ready). Both generate HTTP routes. Both have policies. Both have typed input (introspected from handler signature). Different execution model.
+
+**Signal declarations:** Class attributes on a Workflow. `open = Signal(kind=ActionKind.CREATE, policies=[...])`. The `on_open` method is the handler, matched by convention (`on_` + signal name).
+
+**Signal transport:** Pluggable via `register_signal_transport()`. DBOS uses `DBOS.send()/recv()`. Could be a message bus, WebSocket, or plain async. The domain doesn't know the transport.
+
+**Programmatic send:** `MaintenanceJob.approval.send(job_id, payload, actor=actor)`. Same enforcement as HTTP.
+
+---
+
+## 53. Input/output schema introspected from method signatures
+
+**Decision:** The `@action` decorator and Signal handlers introspect the method signature at class creation time to build Pydantic input models. Three styles detected automatically:
+
+- No params (besides self/ctx) -> no request body
+- Single `BaseModel` param -> validate through that model
+- Plain typed params -> auto-generate a Pydantic model from the signature
+
+Output: if return type is a `BaseModel` subclass, serialize through it. Otherwise serialize all resource fields.
+
+**Reasoning:** NestJS-style. The method signature IS the API contract. No separate DTO classes unless you want custom validation (use a BaseModel param). No config. Type hints drive everything.
+
+**Performance:** Introspection runs once at import time. Generated Pydantic models are compiled by pydantic-core (Rust). Zero per-request overhead.
+
+---
+
+## 54. DBOS for durable workflow execution
+
+**Decision:** DBOS (a Python library, not a sidecar) provides durable workflow execution. It checkpoints workflow state in Postgres system tables. On crash, workflows resume from the last completed step.
+
+**Wiring:** The derive layer applies `@DBOS.workflow()` to `on_` handlers and maps WorkflowContext methods to DBOS primitives:
+- `ctx.receive(signal)` -> `DBOS.recv(topic, timeout)`
+- `ctx.save()` -> `@DBOS.step()` that persists the resource
+- `ctx.sleep(duration)` -> `DBOS.sleep(seconds)`
+- `Signal.send(id, payload)` -> `DBOS.send(workflow_id, payload, topic)`
+
+**Scale:** 20K concurrent workflows. Most are suspended (rows in Postgres, zero resources). Shared connection pool (~20 connections), not one per workflow. DBOS queues provide concurrency control for burst scenarios.
+
+**No lock-in:** DBOS is optional. Without it, `ctx.receive` polls a DB table, `ctx.save` is a plain DB write, `ctx.sleep` is `asyncio.sleep`. Same handler code, less durability.
+
+---
+
+## 55. Three-package structure: ironbridge / lightwork / lightwork_web
+
+**Decision:** Supersedes Decision 49.
+
+- `ironbridge/` -- the framework. Resource, Workflow, Signal, Actor, policies, guards, enforcement, relationships, graph. No HTTP, no business logic, no external dependencies.
+- `lightwork/` -- the domain app. Resources, workflows, services, connectors, channels, subscriptions. Imports from ironbridge.
+- `lightwork_web/` -- the web entry point. FastAPI app, route derivation, middleware (actor resolution, error handlers), startup wiring. Imports from both.
+
+**Dependency direction:** `lightwork_web/ -> lightwork/ -> ironbridge/`. `ironbridge/` imports nothing.
+
+**Analogy:** ironbridge = Ash. lightwork = your Phoenix app contexts. lightwork_web = your Phoenix endpoint + router.
+
+---
+
+## 56. Domain services hold business logic, workflows are thin
+
+**Decision:** Workflow `on_` handlers are thin. They delegate to domain service classes for business logic. Domain services are plain Python classes with injected dependencies (connectors, repos).
+
+```
+Resource  = what it IS (data, relationships, policies)
+Workflow  = what happens TO it (signals, thin handlers, ctx.save)
+Service   = what it DOES (business logic, external calls)
+```
+
+**Reasoning:** The handler should be readable in 5 lines. "Load, delegate, save." The service is where the real logic lives. Services are testable with mock dependencies. Handlers are so thin they barely need tests.
+
+**DI:** Services are constructed at startup in `create_services()` with their connectors. Stored on `app.state.services`. Workflow handlers access them via `ctx.services`. No DI container, no framework.
+
+---
+
+## 57. Connectors are plain clients, not framework abstractions
+
+**Decision:** External service clients (Twilio, Nylas, Alto, Stripe, Anthropic, etc.) are plain Python classes in `lightwork/connectors/`. No `BaseConnector`, no registry, no derive. Just classes with methods, initialized at startup, injected into services.
+
+**Reasoning:** There's ~12 connectors. Each is unique. A framework abstraction would add ceremony without reducing code. Just init and pass.
+
+---
+
+## 58. Modules define URL structure and domain grouping
+
+**Decision:** A `Module` declares a URL prefix and groups resources. Modules nest for sub-domain structure. Routes are auto-derived from the resources in each module.
+
+```python
+class MaintenanceModule(Module):
+    prefix = "/maintenance"
+    resources = [MaintenanceJob, Invoice]
+
+class LightworkApp(Module):
+    prefix = "/api"
+    modules = [MaintenanceModule, SchedulingModule, ...]
+```
+
+`LightworkApp.mount(app)` recursively mounts all resources as FastAPI routes.
+
+**Signal routes included:** Signals generate POST routes alongside action routes. CREATE signals -> `POST /{prefix}/{signal_name}`. Other signals -> `POST /{prefix}/{id}/{signal_name}`.
+
+---
+
+## 59. Relationships are class attributes, graph built at startup
+
+**Decision:** Relationships declared as class attributes on the Resource using `belongs_to()`, `has_many()`, `has_one()`, `many_to_many()`. The metaclass collects them into `__relationships__`. A `ResourceGraph` built at startup resolves string references and validates the full domain model.
+
+```python
+class MaintenanceJob(Workflow):
+    branch     = belongs_to(Branch)
+    contractor = belongs_to(Contractor, optional=True)
+    invoices   = has_many(Invoice)
+```
+
+**Convention:** `belongs_to(Foo)` infers `key="foo_id"`. Override with `key=` when the convention doesn't match (e.g., `belongs_to(Branch, key="office_id")`).
+
+**Target:** Class reference preferred (autocomplete, refactoring). String for circular/forward references.
+
+**Graph enables:** Auto-nested routes (children under parent), authorization cascade (walk up to check parent), startup validation (missing FKs, unregistered targets), API schema endpoint.
+
+---
+
+## 60. Resource maps 1-to-1 to an Ash resource
+
+**Decision:** A Resource declares everything about a domain concept in one class: data layer config (Meta), attributes (Pydantic-style fields), relationships (belongs_to/has_many), actions (sync CRUD), policies, and guards. Workflow extends it with signals and async handlers.
+
+**Field style:** Pydantic (`title: str`, `status: str = "open"`, `amount: Decimal = Field(gt=0)`). The framework converts to SQLAlchemy columns under the hood. The developer never writes `mapped_column()` or `ForeignKey()`.
+
+| Ash | Ironbridge |
+|---|---|
+| `use Ash.Resource` | `class Foo(Resource)` / `class Foo(Workflow)` |
+| `data_layer: AshPostgres` | Framework handles (SQLAlchemy under the hood) |
+| `postgres do table "x" end` | `class Meta: table = "x"` |
+| `attribute :name, :string` | `name: str` |
+| `belongs_to :user, MyApp.User` | `user = belongs_to(User)` |
+| `has_many :comments, MyApp.Comment` | `comments = has_many(Comment)` |
+| `defaults [:create, :read]` | `default_actions = ["create", "get", "list"]` |
+| `update :close do ... end` | `@action(ActionKind.UPDATE) def close(self)` |
+| `policy action(:close) do ... end` | `@policy(role_is("admin"))` on the action |
+
+**Reasoning:** One class per domain concept. Everything visible. No split across model/dto/repo/service/router files. The framework derives the infrastructure from the declarations.
+
+---
+
+## 61. `references` relationship for shared resources
+
+**Decision:** A fifth relationship type: `references(Target)`. Declares "I link to a shared resource, but neither owns the other." Distinct from `belongs_to` which implies parent-child ownership.
+
+```python
+class MaintenanceJob(Workflow):
+    branch = belongs_to(Branch)       # child of Branch
+    thread = references(Thread)       # links to Thread, but Thread isn't mine
+```
+
+**Route effect:** The referenced resource's children (e.g., Message belongs_to Thread) get mounted under the referencing resource, with ACL checked against the referencing resource.
+
+```
+GET /api/maintenance/jobs/{job_id}/messages  -> loads job, checks ACL, filters by job.thread_id
+```
+
+**Graph behavior:** `references` does NOT count as `belongs_to` for `parent_of()`, `roots()`, or `ancestry()`. A resource with only `references` (no `belongs_to`) is still a root. `references_for()` returns these relationships separately.
+
+**Use case:** Thread is a platform resource (ironbridge). Multiple domain resources (Call, Enquiry, MaintenanceJob) reference it. Thread doesn't belong to any one domain.
+
+---
+
+## 62. Route scoping: listed = top-level, unlisted children auto-nest
+
+**Decision:** Resources listed in a Module's `resources` are top-level routes under the module prefix. Resources NOT listed but with a `belongs_to` pointing to a listed resource auto-nest under the parent's routes.
+
+```python
+class MaintenanceModule(Module):
+    prefix = "/maintenance"
+    resources = [MaintenanceJob]
+    # Invoice belongs_to MaintenanceJob (via graph) -> auto: /jobs/{id}/invoices
+    # JobMessage belongs_to MaintenanceJob -> auto: /jobs/{id}/messages
+```
+
+**Override:** Use a dict instead of a list for explicit paths:
+```python
+resources = {
+    MaintenanceJob: "/jobs",
+    Invoice: "/jobs/{job_id}/invoices",   # or "/invoices" for top-level
+}
+```
+
+**List = auto-nest from graph. Dict = explicit control.**
+
+---
+
+## 63. Custom route names via `name=` parameter
+
+**Decision:** `@action(name="approve-quote")` and `Signal(name="open-job")` control the URL segment. The Python method/attribute name is the identifier in code. The `name` is the URL path.
+
+```python
+@action(kind=ActionKind.ACTION, name="approve-quote")
+def approve_quote(self) -> "MaintenanceJob":  # Python name
+    ...
+# POST /maintenance/jobs/{id}/approve-quote   # URL name
+```
+
+Default: method name used as route name. Override when Python naming conventions (snake_case) don't match desired URL conventions (kebab-case).
+
+---
+
+## 64. Extension system: per-resource, per-module, graph-inherited
+
+**Decision:** Extensions (plugins) are instances with config, declared at three levels. They transform resources at registration time -- adding fields, actions, policies, guards, hooks.
+
+**Three levels, cascading:**
+- **Resource-level:** `class Meta: extensions = [SoftDelete()]` -- this resource only
+- **Module-level:** `class MaintenanceModule(Module): extensions = [AuditLog()]` -- all resources in module
+- **Graph-inherited:** Extension on Branch propagates to all resources that `belongs_to` Branch
+
+**Merge rule:** Same extension type on a child overrides the parent's. Different types accumulate.
+
+**Extension base class:**
+```python
+class Extension:
+    # Startup hooks (once per resource)
+    def on_resource(self, cls): ...           # add fields, policies, guards
+    def on_action(self, cls, name, meta): ... # wrap or modify actions
+    def on_signal(self, cls, name, sdef): ... # wrap or modify signals
+    def on_route_derived(self, router, cls): ...
+
+    # Per-request hooks
+    def before_action(self, actor, resource, action_name, **kw): ...
+    def after_action(self, actor, resource, action_name, result): ...
+    def before_signal(self, actor, resource, signal_name, payload): ...
+    def after_signal(self, actor, resource, signal_name, payload): ...
+```
+
+**Core features as extensions:**
+- `TenantIsolation(key="tenant_id")` -- injects column, RLS, same_tenant policy
+- `SoftDelete(field="is_deleted")` -- injects field, not_deleted guard, replaces destroy
+- `Timestamps()` -- injects created_at, updated_at, auto-updates
+- `AuditLog(actions="*")` -- injects created_by/updated_by, after-action logging
+- `Pagination(default_per_page=25)` -- wraps list routes with page/per_page
+- `ReadOnly()` -- removes all write actions and signals
+- `RateLimiting(default="100/min")` -- applies limits to derived routes
+
+**Reasoning:** Follows Ash's extension model (AshPostgres, AshJsonApi are extensions). Core features like tenancy become optional, configurable, and composable. The framework core shrinks to: Resource, Action, Signal, Workflow, Graph. Everything else plugs in.
+
+---
+
+## 65. Default action override via `default_create` / `default_update` helpers
+
+**Decision:** To add side effects to a default action without rewriting it, import the default body function and call it:
+
+```python
+from ironbridge.shared.framework.defaults import default_create
+
+@action(kind=ActionKind.CREATE)
+def create(self, **kwargs) -> "MaintenanceJob":
+    default_create(self, **kwargs)
+    log_audit("created", self.id)
+    return self
+```
+
+No hooks, no super(), no magic method names. Just function composition.
+
+For cross-cutting concerns (observability on all actions), use `@on` subscriptions:
+```python
+@on(MaintenanceJob, "*")
+async def audit_all(job, action_name, actor):
+    log_audit(action_name, job.id, actor.id)
+```
+
+---
+
+## 66. Auth strategy is a FastAPI dependency, not framework concern
+
+**Decision:** The framework provides `ActorMiddleware` and `resolve_actor()`. The app provides the actual auth logic as FastAPI dependencies.
+
+Different routes can use different auth strategies:
+```python
+class MaintenanceModule(Module):
+    auth = web_actor          # JWT/session
+
+class TwilioWebhookModule(Module):
+    auth = twilio_actor       # signature verification
+
+class PublicModule(Module):
+    auth = public_actor       # anonymous
+```
+
+The Actor's `metadata: dict` carries whatever the auth strategy puts in it (JWT claims, session data, API key permissions). The framework never prescribes what's in metadata. Custom policies can read it:
+```python
+@policy(has_claim("org_type", "enterprise"))
+```
+
+---
+
+## 67. Codegen considered, deferred
+
+**Decision:** Runtime derive (current approach) is sufficient for now. Codegen (generating FastAPI routes as static files) was considered for better debugging and IDE support but deferred.
+
+**Trade-off:** Runtime derive has one source of truth (the Resource class). Codegen creates two (Resource + generated files) with drift risk. The debugging benefit doesn't justify the maintenance cost at current scale.
+
+**Future:** If debugging derived routes becomes a pain, add `ironbridge generate --check` as an optional CI step that verifies generated files match the resource definitions. Same derive logic, output to disk instead of memory.
+
+---
+
+## 68. `@workflow` decorator marks durable functions (per-function, not per-class)
+
+**Decision:** The `@workflow` decorator marks a specific function as durable (DBOS wraps it). The `Workflow` mixin marks the class as workflow-capable (has signals). They work together.
+
+```python
+class Job(Resource, Workflow):
+    @workflow                          # durable, DBOS wraps this
+    async def on_start(self, ctx): ...
+
+    def archive(self) -> "Job": ...    # not durable, regular action
+
+    @action(kind=ActionKind.ACTION)
+    @workflow                          # action + durable, composes
+    async def reassign(self, ctx): ...
+```
+
+**Reasoning:** Durability is a per-function decision. A class may have one durable handler and ten sync actions. Wrapping everything in DBOS wastes DB writes. The decorator is explicit, visible, and composable with `@action`, `@policy`, `@guard`.
+
+---
+
+## 69. Workflow is a single continuous function with pause points
+
+**Decision:** A workflow is one async function that runs top-to-bottom, pausing at `ctx.receive()` to wait for signals. Not a DAG of steps (Reactor), not separate handlers per signal.
+
+```python
+@workflow
+async def on_start(self, ctx, description: str):
+    self.state = "sourcing"
+    ctx.save()
+    quote = await ctx.receive("quote_received")     # pause
+    self.state = "quote_approval"
+    ctx.save()
+    decision = await ctx.receive("approval")         # pause
+    self.state = "booking"
+    ctx.save()
+```
+
+**CREATE signals** start the workflow (the `on_` handler runs). **Non-CREATE signals** feed into the running workflow's `ctx.receive()`. No separate `on_` handler per signal.
+
+**Reasoning:** Interactive workflows (wait for human approval, wait for webhook) are conversations, not pipelines. A continuous function reads naturally. For parallel orchestration, use `asyncio.gather()` or `DBOS.start_workflow()` inside the function.
+
+---
+
+## 70. Framework composes with DBOS, doesn't compete
+
+**Decision:** DBOS is used directly for low-level durability primitives. The framework adds domain modeling and HTTP derivation on top. No wrapping of DBOS APIs that developers might need.
+
+| DBOS provides | Framework adds |
+|---|---|
+| `@DBOS.workflow()` | `@workflow` decorator (marks which functions) |
+| `DBOS.recv()` | `ctx.receive()` (adds actor update, signal lifecycle) |
+| `DBOS.send()` | `Signal.send()` (adds policy enforcement) |
+| `DBOS.set_event/get_event` | `ctx.respond()` / `SignalHandle.respond()` |
+| `DBOS.step()` | `ctx.save()` (persist resource state) |
+| `DBOS.start_workflow()` | Used directly in workflow code for parallel work |
+| `Queue` | Used directly for rate-limited execution |
+| `@DBOS.scheduled()` | Used directly for cron jobs |
+
+The developer can use DBOS APIs directly inside a `@workflow` function when the framework abstractions don't cover their use case.
+
+---
+
+## 71. Signal lifecycle with `async with ctx.receive()`
+
+**Decision:** Signals have explicit lifecycle: open on enter, closed on exit. The `async with` context manager makes this explicit.
+
+```python
+async with ctx.receive("approval", timeout=timedelta(days=7)) as approval:
+    if not approval:                    # timed out
+        self.state = "escalated"
+        ctx.save()
+        return
+    self.state = "booking"
+    ctx.save()
+    approval.respond({"state": self.state})   # response to sender
+# Signal CLOSED. POST /jobs/{id}/approval -> 410 Gone.
+```
+
+**SignalHandle** returned by `async with` carries payload + response channel:
+- `approval["amount"]` -- access payload
+- `approval.respond(data)` -- send response to signal sender
+- `bool(approval)` -- False if timed out
+- `approval.signal` -- which signal name
+- `approval.actor` -- who sent it
+
+**What `with` provides:**
+- **On enter:** Signal channel opens. Route accepts POSTs. DBOS.recv() starts.
+- **On exit:** Signal channel closes. Late POSTs return 410 Gone. Stale messages discarded.
+- **On timeout:** Handle is falsy. Workflow handles it. Channel still closes on exit.
+- **On exception:** Channel closes. Cleanup guaranteed.
+
+**Why not plain `await`:** Without explicit close, stale signals can be consumed by future `ctx.receive()` calls on the same topic. A workflow that loops back to "approval" would pick up an old approval from a previous cycle. The `with` block prevents this by discarding unconsumed messages on exit.
+
+**Plain `await` still works** for simple cases where you don't need explicit close:
+```python
+quote = await ctx.receive("quote_received")
+```
+The signal closes implicitly at the next receive or workflow completion. `with` is for when you need the guarantee.
+
+---
+
+## 72. `ctx.respond()` for bidirectional signal communication
+
+**Decision:** Workflow signal handlers can respond to the signal sender with assembled data. The response can include data from multiple resources the workflow touched.
+
+```python
+approval = Signal(
+    policies=[role_is("admin")],
+    response=ApprovalResponse,       # response type for OpenAPI
+)
+
+async with ctx.receive("approval") as decision:
+    self.state = "booking"
+    contractor = await ctx.services.contractors.get(self.contractor_id)
+    ctx.save()
+    decision.respond(ApprovalResponse(
+        job_id=self.id,
+        state=self.state,
+        contractor_name=contractor.name,
+    ))
+```
+
+**Signal declaration** includes `response=` for OpenAPI schema generation. The derive layer uses it to document the response type on the signal route.
+
+**Without respond:** Caller gets 202 `{"accepted": true}` (fire-and-forget).
+**With respond:** Caller gets 200 with the assembled response (sync).
+
+**Implementation:** `respond()` uses `DBOS.set_event()`. The derive layer for `responds=True` signals calls `DBOS.get_event()` to wait for the response before returning to the HTTP caller.
+
+**Best-effort delivery:** If the HTTP caller disconnects before `respond()` is called, the response is dropped. The workflow continues. The state change is committed regardless. The caller can `GET /jobs/{id}` to see the result.
+
+---
+
+## 73. Guards on signals prevent stale signal delivery
+
+**Decision:** Signals can declare guards (same as actions). The derive layer checks guards before dispatching the signal to the workflow. This provides state protection without requiring `with` lifecycle management.
+
+```python
+approval = Signal(
+    policies=[role_is("admin")],
+    guards=[in_state("quote_approval")],
+)
+```
+
+If the job is no longer in `quote_approval` state when the approval signal arrives, the derive layer returns 409 Conflict. The signal never reaches the workflow. No stale message in the queue.
+
+**Combined with `with` lifecycle:** Guards check resource state. `with` manages the receive channel. Both protect against stale signals, at different levels:
+- Guards: "is this resource in the right state for this signal?" (resource-level)
+- `with`: "is this workflow currently waiting for this signal?" (workflow-level)

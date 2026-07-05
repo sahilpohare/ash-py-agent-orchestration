@@ -29,6 +29,43 @@ R = TypeVar("R", bound=Resource)
 _IDEMPOTENCY_COL = "_idempotency_key"
 
 
+class PaginatedResult[R]:
+    """Paginated query result."""
+    def __init__(self, data: list[R], page: int, per_page: int, total: int):
+        self.data = data
+        self.page = page
+        self.per_page = per_page
+        self.total = total
+
+    @property
+    def pages(self) -> int:
+        if self.per_page == 0:
+            return 0
+        return (self.total + self.per_page - 1) // self.per_page
+
+    @property
+    def has_next(self) -> bool:
+        return self.page < self.pages
+
+    @property
+    def has_prev(self) -> bool:
+        return self.page > 1
+
+    def to_dict(self, serialize_fn=None) -> dict:
+        items = [serialize_fn(item) if serialize_fn else item for item in self.data]
+        return {
+            "data": items,
+            "meta": {
+                "page": self.page,
+                "per_page": self.per_page,
+                "total": self.total,
+                "pages": self.pages,
+                "has_next": self.has_next,
+                "has_prev": self.has_prev,
+            },
+        }
+
+
 class SqlAlchemyRepository[R: Resource]:
     def __init__(self, session: Session, resource_cls: type[R]) -> None:
         self._session = session
@@ -36,6 +73,16 @@ class SqlAlchemyRepository[R: Resource]:
         mapper = sa_inspect(resource_cls)
         self._pk = mapper.primary_key[0].name
         self._idempotent = resource_cls.__meta__.get("idempotent", False)
+
+    @property
+    def session(self):
+        """Raw SQLAlchemy session for complex queries."""
+        return self._session
+
+    def execute(self, sql: str, **params) -> Any:
+        """Execute raw SQL. Returns the result proxy."""
+        from sqlalchemy import text
+        return self._session.execute(text(sql), params)
 
     # ── Queries ──────────────────────────────────────────────────────────────
 
@@ -50,6 +97,72 @@ class SqlAlchemyRepository[R: Resource]:
         if filters:
             q = q.filter_by(**filters)
         return q.all()
+
+    def paginate(
+        self,
+        page: int = 1,
+        per_page: int = 25,
+        sort: str | None = None,
+        order: str = "asc",
+        filters: dict[str, Any] | None = None,
+    ) -> "PaginatedResult[R]":
+        q = self._session.query(self._cls)
+
+        # Apply filters
+        if filters:
+            from sqlalchemy import and_, or_
+            for field, value in filters.items():
+                col = getattr(self._cls, field, None)
+                if col is None:
+                    continue
+                if isinstance(value, dict):
+                    # Operator-based: {"gt": 5, "lt": 10, "in": [...], "like": "%foo%"}
+                    for op, val in value.items():
+                        if op == "gt":
+                            q = q.filter(col > val)
+                        elif op == "gte":
+                            q = q.filter(col >= val)
+                        elif op == "lt":
+                            q = q.filter(col < val)
+                        elif op == "lte":
+                            q = q.filter(col <= val)
+                        elif op == "in":
+                            q = q.filter(col.in_(val))
+                        elif op == "not_in":
+                            q = q.filter(~col.in_(val))
+                        elif op == "like":
+                            q = q.filter(col.like(val))
+                        elif op == "ilike":
+                            q = q.filter(col.ilike(val))
+                        elif op == "ne":
+                            q = q.filter(col != val)
+                        elif op == "is_null":
+                            q = q.filter(col.is_(None) if val else col.isnot(None))
+                else:
+                    q = q.filter(col == value)
+
+        # Count before pagination
+        total = q.count()
+
+        # Sort
+        if sort:
+            col = getattr(self._cls, sort, None)
+            if col is not None:
+                if order == "desc":
+                    q = q.order_by(col.desc())
+                else:
+                    q = q.order_by(col.asc())
+
+        # Paginate
+        offset = (page - 1) * per_page
+        items = q.offset(offset).limit(per_page).all()
+
+        return PaginatedResult(
+            data=items,
+            page=page,
+            per_page=per_page,
+            total=total,
+        )
 
     # ── Writes ───────────────────────────────────────────────────────────────
 
