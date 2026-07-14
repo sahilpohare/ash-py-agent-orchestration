@@ -1,25 +1,28 @@
 """
-Signal -- a message a Workflow can receive.
-
-Signals declare handler explicitly via handler= arg or @signal.handler decorator.
-No naming convention. No auto-discovery.
+Signal -- typed, awaitable entry points for Workflows.
 
     class Job(Resource, Workflow):
-        start = Signal(kind=ActionKind.CREATE, policies=[role_is("admin")])
+        start = Signal(kind=ActionKind.CREATE, policies=[role("admin")])
+        submit_quote = Signal(policies=[system()], input=QuotePayload)
+        approve_quote = Signal(policies=[role("admin")], input=ApprovalPayload)
 
-        @start.handler
-        async def handle_start(self, ctx, description: str):
-            ...
+        async def on_start(self, description: str):
+            self.status = "opened"
+            self.save()
 
-    # Or:
-        async def my_handler(self, ctx, description: str):
-            ...
+            quote: QuotePayload = await self.submit_quote          # typed, awaitable
+            self.quote_amount = quote.amount                        # autocomplete
 
-        start = Signal(kind=ActionKind.CREATE, handler=my_handler)
+            async with self.approve_quote(timeout=timedelta(days=7)) as approval:
+                if not approval:
+                    return
+                self.status = "approved"
+                self.save()
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable
 
 from pydantic import BaseModel
@@ -37,10 +40,12 @@ class SignalDef:
     name: str
     kind: ActionKind | None
     policies: list[PolicyDef]
+    guards: list  # list[GuardDef]
     input_model: type[BaseModel] | None
     input_style: str  # "none" | "model" | "fields"
     owner_cls: type | None = None
     _handler_fn: Callable | None = field(default=None, repr=False)
+    _send_fn: Callable | None = field(default=None, repr=False)
 
     def send(self, resource_id: str | None, payload: Any = None, *, actor: Any = None) -> None:
         if self._send_fn is not None:
@@ -51,43 +56,140 @@ class SignalDef:
                 f"Did you register a signal transport?"
             )
 
-    _send_fn: Callable | None = field(default=None, repr=False)
+
+class BoundSignal:
+    """
+    A Signal bound to a resource instance. Awaitable and callable.
+
+        quote = await self.submit_quote                    # simple await
+        async with self.approve_quote(timeout=...) as a:   # with timeout
+    """
+
+    def __init__(self, signal: Signal, instance: Any):
+        self._signal = signal
+        self._instance = instance
+        self._timeout: timedelta | None = None
+
+    def __call__(self, timeout: timedelta | None = None) -> BoundSignal:
+        """Set timeout. Returns self for use as async context manager."""
+        self._timeout = timeout
+        return self
+
+    def __await__(self):
+        """Simple await: quote = await self.submit_quote"""
+        return self._do_recv().__await__()
+
+    async def _do_recv(self) -> Any:
+        """Execute the receive via the workflow's recv_fn."""
+        instance = self._instance
+        recv_fn = getattr(instance, "_workflow_recv_fn", None)
+        if recv_fn is None:
+            raise RuntimeError("No recv function set. Is this running inside a workflow?")
+
+        name = self._signal.name
+        timeout = self._timeout
+
+        # Track open signals
+        open_signals = getattr(instance, "_open_signals", None)
+        if open_signals is not None:
+            open_signals.add(name)
+
+        try:
+            result = await recv_fn((name,), timeout)
+        finally:
+            if open_signals is not None:
+                open_signals.discard(name)
+
+        if result is None:
+            return _make_handle(name, None, None, self._signal)
+
+        # Convert raw result to SignalHandle with typed payload
+        from .workflow import SignalMessage
+        if isinstance(result, SignalMessage):
+            return _make_handle(name, result.payload, result.actor, self._signal)
+
+        return _make_handle(name, result, None, self._signal)
+
+    # Async context manager support
+    async def __aenter__(self) -> Any:
+        return await self._do_recv()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        pass
+
+    def send(self, resource_id: str | None = None, payload: Any = None, *, actor: Any = None) -> None:
+        """Send this signal to a resource."""
+        self._signal.send(resource_id, payload, actor=actor)
+
+
+def _make_handle(signal_name: str, payload: Any, actor: Any, signal: Signal) -> Any:
+    """Create a SignalHandle with typed payload if input model is declared."""
+    from .workflow import SignalHandle
+
+    # Validate and convert payload to Pydantic model if input= is set
+    input_model = signal._explicit_input
+    if input_model and payload is not None and isinstance(payload, dict):
+        try:
+            typed_payload = input_model(**payload)
+        except Exception:
+            typed_payload = payload
+    else:
+        typed_payload = payload
+
+    return SignalHandle(
+        signal=signal_name,
+        payload=typed_payload,
+        actor=actor,
+    )
 
 
 class Signal:
     """
     Descriptor that declares a signal on a Workflow class.
 
-    Handler binding (explicit, no convention):
-        # Option 1: decorator
-        start = Signal(kind=ActionKind.CREATE)
-        @start.handler
-        async def handle_start(self, ctx): ...
+    On the class: Signal declaration (introspectable, collects metadata).
+    On an instance: returns BoundSignal (awaitable, callable for timeout).
 
-        # Option 2: reference
-        async def handle_start(self, ctx): ...
-        start = Signal(kind=ActionKind.CREATE, handler=handle_start)
+        submit_quote = Signal(policies=[system()], input=QuotePayload)
+
+        # In workflow handler:
+        quote: QuotePayload = await self.submit_quote
+        quote.amount     # typed, autocomplete works
     """
 
     def __init__(
         self,
         kind: ActionKind | None = None,
         policies: list | None = None,
+        guards: list | None = None,
         input: type[BaseModel] | None = None,
         name: str | None = None,
         handler: Callable | None = None,
     ):
         self.kind = kind
         self.policies = policies or []
+        self.guards = guards or []
         self._explicit_input = input
         self._name_override = name
         self._handler_fn: Callable | None = handler
         self.name: str | None = None
         self._def: SignalDef | None = None
+        self._attr_name: str | None = None
 
-        # Mark handler as workflow if provided
         if handler is not None:
             handler._is_workflow = True
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        """Called when the descriptor is assigned to a class attribute."""
+        self._attr_name = name
+        if self.name is None:
+            self.name = self._name_override or name
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> Signal | BoundSignal:
+        """Descriptor protocol: class access returns Signal, instance access returns BoundSignal."""
+        if obj is None:
+            return self  # class-level access: Job.submit_quote -> Signal
+        return BoundSignal(self, obj)  # instance-level: self.submit_quote -> BoundSignal
 
     def handler(self, fn: Callable) -> Callable:
         """Decorator: register fn as this signal's handler."""
@@ -99,7 +201,6 @@ class Signal:
         """Convert to a SignalDef. Called by Workflow.__init_subclass__."""
         self.name = self._name_override or attr_name
 
-        # Resolve handler: explicit first, then on_ convention
         handler = self._handler_fn
         if handler is None:
             convention_name = f"on_{attr_name}"
@@ -107,7 +208,6 @@ class Signal:
             if convention_fn is not None and callable(convention_fn):
                 handler = convention_fn
 
-        # Resolve input model from handler signature
         input_model = self._explicit_input
         input_style = "model" if input_model else "none"
 
@@ -118,6 +218,7 @@ class Signal:
             name=self.name,
             kind=self.kind,
             policies=self.policies,
+            guards=self.guards,
             input_model=input_model,
             input_style=input_style,
             owner_cls=owner_cls,
@@ -125,7 +226,7 @@ class Signal:
         )
         return self._def
 
-    def send(self, resource_id: str | None, payload: Any = None, *, actor: Any = None) -> None:
+    def send(self, resource_id: str | None = None, payload: Any = None, *, actor: Any = None) -> None:
         if self._def is None:
             raise RuntimeError(f"Signal not yet bound to a Workflow class")
         self._def.send(resource_id, payload, actor=actor)

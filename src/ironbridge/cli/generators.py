@@ -839,115 +839,32 @@ class {name}App(Module):
 
 
 def _web_main_template(name, snake_name, module_names, connectors):
-    provider_lines = []
-    for conn in connectors:
-        class_name = conn.title().replace("_", "")
-        provider_lines.append(f'    # providers.register("{conn}", {class_name}Client(...))')
-
-    providers_block = "\n".join(provider_lines) if provider_lines else "    pass"
-
     return f'''"""
 {name} web entry point.
+
+    python -m {snake_name}_web.main          # run server
+    python -m {snake_name}_web.main migrate  # create tables
+    open http://localhost:8000/docs
 """
 import os
+import sys
 
 os.environ.setdefault("DATABASE_URL", "postgresql://{snake_name}:{snake_name}@localhost:5432/{snake_name}")
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-
-from dbos import DBOS
-
-from ironbridge.shared.framework import (
-    Providers, set_providers, ResourceGraph,
-    init_modules, ready_modules, shutdown_modules,
-)
-from ironbridge.shared.framework.enforcement import PolicyDenied, GuardFailed
-from ironbridge.shared.framework.actor import Actor, Origin
-from ironbridge_web.derive.router import derive_router
-
+from fastapi import FastAPI
+from ironbridge_web import Ironbridge
 from {snake_name}.app import {name}App
-
-# Import subscriptions to register @on handlers
 import {snake_name}.subscriptions  # noqa: F401
 
-DATABASE_URL = os.environ["DATABASE_URL"]
-
-
-def create_app() -> FastAPI:
-    app = FastAPI(title="{name}", version="0.1.0")
-
-    # --- Error handlers ---
-    @app.exception_handler(PolicyDenied)
-    async def on_policy_denied(request: Request, exc: PolicyDenied):
-        return JSONResponse(403, {{"error": "forbidden", "message": str(exc), "policy": exc.policy_name}})
-
-    @app.exception_handler(GuardFailed)
-    async def on_guard_failed(request: Request, exc: GuardFailed):
-        return JSONResponse(409, {{"error": "conflict", "message": str(exc), "guard": exc.guard_name}})
-
-    @app.exception_handler(ValueError)
-    async def on_value_error(request: Request, exc: ValueError):
-        return JSONResponse(400, {{"error": "bad_request", "message": str(exc)}})
-
-    # --- Actor middleware ---
-    @app.middleware("http")
-    async def actor_middleware(request: Request, call_next):
-        # TODO: replace with JWT/session auth
-        request.state.actor = Actor(
-            id=request.headers.get("X-User-Id", "anonymous"),
-            tenant_id=request.headers.get("X-Tenant-Id", "default"),
-            role=request.headers.get("X-User-Role", "viewer"),
-            origin=Origin(channel="web_dashboard"),
-        )
-        return await call_next(request)
-
-    # --- Health ---
-    @app.get("/health")
-    def health():
-        return {{"status": "ok"}}
-
-    # --- Providers ---
-    providers = Providers()
-{providers_block}
-    set_providers(providers)
-
-    # --- DBOS ---
-    DBOS(config={{"name": "{snake_name}", "system_database_url": DATABASE_URL}})
-    DBOS.launch()
-
-    # --- Initialize modules ---
-    modules = {name}App.modules
-    init_modules(modules, providers)
-
-    # --- Graph ---
-    graph = ResourceGraph()
-    graph.build()
-    errors = graph.validate()
-    if errors:
-        print(f"Graph validation errors: {{errors}}")
-
-    # --- Mount routes ---
-    for mod_cls in modules:
-        for resource in mod_cls.all_resources():
-            prefix = f"/api/{{mod_cls.prefix}}" if mod_cls.prefix else "/api"
-            app.include_router(derive_router(resource), prefix=prefix)
-
-    # --- Ready ---
-    ready_modules(modules)
-
-    # --- Shutdown ---
-    @app.on_event("shutdown")
-    def shutdown():
-        shutdown_modules(modules)
-
-    return app
-
+app = FastAPI(title="{name}")
+ib = Ironbridge(app, modules={name}App.modules)
 
 if __name__ == "__main__":
-    import uvicorn
-    app = create_app()
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    if len(sys.argv) > 1 and sys.argv[1] == "migrate":
+        ib.migrate()
+    else:
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=8000)
 '''
 
 

@@ -349,12 +349,16 @@ def _parse_dev_token(token: str) -> dict:
 def _threads_component() -> Component:
     return Component(
         name="threads",
-        description="Conversation threads with ordered messages, DBOS-backed queue for serialization",
+        description="Conversation threads with DBOS-backed ordered messages, fan-out, ThreadHandle for workflows",
         variables={"app_name": "lightwork"},
         files={
             "src/{{app_name}}/sessions/__init__.py": """from .thread import Thread
 from .message import Message, MessageRole, ParticipantType
-from .handle import ThreadHandle, make_thread_handle
+from .channel import Channel, ChannelBinding
+from .agent import Agent
+from .operations import append_message, get_messages, create_thread
+from .broadcast import broadcast_message, register_adapter, BaseAdapter
+from .handle import ThreadHandle
 """,
 
             "src/{{app_name}}/sessions/thread.py": """from datetime import datetime, UTC
@@ -363,21 +367,17 @@ from cuid2 import cuid_wrapper
 from sqlalchemy import DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column
 
-from ironbridge.shared.framework import (
-    Resource, action, ActionKind, default_action,
-    has_many,
-)
+from ironbridge.shared.framework import Resource, has_many
 
 _cuid = cuid_wrapper()
 _utcnow = lambda: datetime.now(UTC)
 
 
 class Thread(Resource):
-    \\"\\"\\"Ordered conversation log. Infrastructure resource.\\"\\"\\"
+    \\"\\"\\"Ordered conversation log. Messages appended via operations.append_message.\\"\\"\\"
 
     class Meta:
-        tenant_scoped = True
-        default_actions = ["get"]
+        default_actions = ["get", "list"]
 
     __tablename__ = "threads"
 
@@ -395,10 +395,7 @@ from cuid2 import cuid_wrapper
 from sqlalchemy import BigInteger, DateTime, ForeignKey, JSON, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
-from ironbridge.shared.framework import (
-    Resource, default_action, ActionKind,
-    belongs_to,
-)
+from ironbridge.shared.framework import Resource, belongs_to
 
 _cuid = cuid_wrapper()
 _utcnow = lambda: datetime.now(UTC)
@@ -417,13 +414,10 @@ class ParticipantType(StrEnum):
 
 
 class Message(Resource):
-    \\"\\"\\"A single message in a thread. Append-only.\\"\\"\\"
+    \\"\\"\\"Single message in a thread. Append-only, monotonic position.\\"\\"\\"
 
     class Meta:
-        tenant_scoped = True
         default_actions = ["get", "list"]
-        conflict_columns = ("thread_id", "idempotency_key")
-        conflict_action = "nothing"
 
     __tablename__ = "messages"
     __table_args__ = (
@@ -435,8 +429,8 @@ class Message(Resource):
         String, ForeignKey("threads.id", ondelete="CASCADE"), nullable=False, index=True
     )
     participant_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
-    participant_type: Mapped[str] = mapped_column(String, nullable=False)
-    role: Mapped[str] = mapped_column(String, nullable=False)
+    participant_type: Mapped[str] = mapped_column(String, nullable=False, default="SYSTEM")
+    role: Mapped[str] = mapped_column(String, nullable=False, default="SYSTEM")
     content: Mapped[dict] = mapped_column(JSON, nullable=False)
     position: Mapped[int] = mapped_column(BigInteger, nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
@@ -445,87 +439,381 @@ class Message(Resource):
     thread = belongs_to("Thread")
 """,
 
-            "src/{{app_name}}/sessions/handle.py": """from datetime import datetime, UTC
-from typing import Any
+            "src/{{app_name}}/sessions/operations.py": '''# Thread operations. DBOS-backed for durability and exactly-once semantics.
+#
+# append_message: durable append with SELECT FOR UPDATE for monotonic position.
+# get_messages: read message history.
+# create_thread: create a new thread.
+#
+# @step functions. The derive layer wraps them with @DBOS.step automatically.
+
+import hashlib
+from datetime import datetime, UTC
 
 from cuid2 import cuid_wrapper
+from sqlalchemy import text
+
+from ironbridge.shared.framework import step
 
 _cuid = cuid_wrapper()
 
 
+@step(retries=3, backoff=2.0, interval=1)
+def create_thread() -> str:
+    """Create a thread, return its id."""
+    from ironbridge.shared.db import SessionLocal
+
+    thread_id = _cuid()
+    db = SessionLocal()
+    try:
+        db.execute(text(
+            "INSERT INTO threads (id, created_at, updated_at) VALUES (:id, now(), now())"
+        ), {"id": thread_id})
+        db.commit()
+        return thread_id
+    finally:
+        db.close()
+
+
+@step(retries=3, backoff=2.0, interval=1)
+def append_message(
+    thread_id: str,
+    content: dict,
+    participant_id: str = "system",
+    participant_type: str = "SYSTEM",
+    role: str = "SYSTEM",
+    idempotency_key: str | None = None,
+) -> dict:
+    """Durable append with monotonic position. SELECT FOR UPDATE serializes writes."""
+    from ironbridge.shared.db import SessionLocal
+
+    msg_id = _cuid()
+    ikey = idempotency_key or hashlib.sha256(
+        f"{thread_id}:{msg_id}".encode()
+    ).hexdigest()[:16]
+
+    db = SessionLocal()
+    try:
+        # Lock thread row -- serializes concurrent appends
+        db.execute(
+            text("SELECT id FROM threads WHERE id = :id FOR UPDATE"),
+            {"id": thread_id},
+        )
+
+        # Next position (monotonic)
+        result = db.execute(
+            text("SELECT COALESCE(MAX(position), -1) + 1 FROM messages WHERE thread_id = :tid"),
+            {"tid": thread_id},
+        )
+        position = result.scalar()
+
+        # Insert (idempotent via unique constraint, ON CONFLICT DO NOTHING)
+        db.execute(text(
+            "INSERT INTO messages (id, thread_id, participant_id, participant_type, role, content, position, idempotency_key, created_at)"
+            " VALUES (:id, :tid, :pid, :ptype, :role, CAST(:content AS jsonb), :pos, :ikey, now())"
+            " ON CONFLICT (thread_id, idempotency_key) DO NOTHING"
+        ), {
+            "id": msg_id,
+            "tid": thread_id,
+            "pid": participant_id,
+            "ptype": participant_type,
+            "role": role,
+            "content": _json_dumps(content),
+            "pos": position,
+            "ikey": ikey,
+        })
+
+        db.commit()
+        return {
+            "id": msg_id,
+            "thread_id": thread_id,
+            "position": position,
+            "role": role,
+            "participant_id": participant_id,
+        }
+    finally:
+        db.close()
+
+
+def get_messages(thread_id: str, limit: int = 200) -> list[dict]:
+    """Read messages for a thread, ordered by position."""
+    from ironbridge.shared.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        result = db.execute(text(
+            "SELECT id, thread_id, participant_id, participant_type, role, content, position, created_at"
+            " FROM messages WHERE thread_id = :tid ORDER BY position ASC LIMIT :lim"
+        ), {"tid": thread_id, "lim": limit})
+        return [dict(row._mapping) for row in result]
+    finally:
+        db.close()
+
+
+def _json_dumps(obj):
+    import json
+    return json.dumps(obj) if isinstance(obj, (dict, list)) else str(obj)
+''',
+
+            "src/{{app_name}}/sessions/handle.py": '''# ThreadHandle -- interface for workflows and resources to interact with a thread.
+#
+#     ctx.thread.add_text("Job opened")
+#     ctx.thread.add_event("state_changed", old="opened", new="sourcing")
+#     history = ctx.thread.get_history()
+#
+# Backed by DBOS steps. Position monotonicity via SELECT FOR UPDATE.
+
+
 class ThreadHandle:
-    \\"\\"\\"
-    Handle for interacting with a thread. Available on ctx.thread.
+    """Handle for a thread. Available as resource.thread or ctx.thread."""
 
-    Usage in workflows:
-        ctx.thread.add_text("Job opened", role="SYSTEM")
-        ctx.thread.add_event("state_changed", old="opened", new="sourcing")
-        history = ctx.thread.get_history()
-    \\"\\"\\"
-
-    def __init__(self, thread_id: str, save_fn: Any = None, list_fn: Any = None):
+    def __init__(self, thread_id: str):
         self._thread_id = thread_id
-        self._save_fn = save_fn
-        self._list_fn = list_fn
-        self._position = 0
 
     @property
     def id(self) -> str:
         return self._thread_id
 
-    def add_message(
-        self,
-        content: dict,
-        participant_id: str = "system",
-        participant_type: str = "SYSTEM",
-        role: str = "SYSTEM",
-        idempotency_key: str | None = None,
-    ) -> dict:
-        self._position += 1
-        ikey = idempotency_key or f"{self._thread_id}:{self._position}"
-        msg = {
-            "id": _cuid(),
-            "thread_id": self._thread_id,
-            "participant_id": participant_id,
-            "participant_type": participant_type,
-            "role": role,
-            "content": content,
-            "position": self._position,
-            "idempotency_key": ikey,
-            "created_at": datetime.now(UTC).isoformat(),
-        }
-        if self._save_fn:
-            self._save_fn(msg)
+    def add_message(self, content: dict, participant_id: str = "system",
+                    participant_type: str = "SYSTEM", role: str = "SYSTEM",
+                    idempotency_key: str | None = None,
+                    broadcast: bool = True) -> dict:
+        """Append a message. Durable, exactly-once, monotonic position. Fan-out to channels."""
+        from .operations import append_message
+        msg = append_message(
+            thread_id=self._thread_id, content=content,
+            participant_id=participant_id, participant_type=participant_type,
+            role=role, idempotency_key=idempotency_key,
+        )
+        if broadcast:
+            try:
+                from .broadcast import broadcast_message
+                broadcast_message(self._thread_id, msg)
+            except Exception:
+                pass  # broadcast failure doesn't break the append
         return msg
 
     def add_text(self, text: str, participant_id: str = "system",
                  participant_type: str = "SYSTEM", role: str = "SYSTEM") -> dict:
+        """Append a text message."""
         return self.add_message(
             content={"version": 1, "parts": [{"type": "text", "text": text}]},
             participant_id=participant_id, participant_type=participant_type, role=role,
         )
 
     def add_event(self, event: str, **data) -> dict:
+        """Append a system event."""
         return self.add_message(
             content={"version": 1, "parts": [{"type": "event", "event": event, **data}]},
         )
 
-    def get_messages(self, limit: int = 200, exclude_types: list[str] | None = None) -> list[dict]:
-        if not self._list_fn:
-            return []
-        messages = self._list_fn(self._thread_id, limit)
-        if exclude_types:
-            return [m for m in messages
-                    if not any(p.get("type") in exclude_types
-                              for p in m.get("content", {}).get("parts", []))]
-        return messages
+    def get_messages(self, limit: int = 200) -> list[dict]:
+        """Read all messages, ordered by position."""
+        from .operations import get_messages
+        return get_messages(self._thread_id, limit)
 
     def get_history(self, limit: int = 200) -> list[dict]:
-        return self.get_messages(limit=limit, exclude_types=["response_reply", "event"])
+        """Messages visible to LLM (excludes events and control messages)."""
+        return [m for m in self.get_messages(limit) if not _is_control(m)]
 
 
-def make_thread_handle(thread_id: str, save_fn: Any = None, list_fn: Any = None) -> ThreadHandle:
-    return ThreadHandle(thread_id=thread_id, save_fn=save_fn, list_fn=list_fn)
+def _is_control(msg: dict) -> bool:
+    content = msg.get("content", {})
+    if isinstance(content, str):
+        return False
+    parts = content.get("parts", []) if isinstance(content, dict) else []
+    return any(p.get("type") in ("event", "response_reply") for p in parts)
+''',
+
+            "src/{{app_name}}/sessions/channel.py": '''from datetime import datetime, UTC
+
+from cuid2 import cuid_wrapper
+from sqlalchemy import DateTime, JSON, String, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column
+
+from ironbridge.shared.framework import (
+    Resource, action, ActionKind, policy, role_is, has_many,
+)
+
+_cuid = cuid_wrapper()
+_utcnow = lambda: datetime.now(UTC)
+
+
+class Channel(Resource):
+    """A communication endpoint (web, sms, whatsapp, slack, discord, etc.)."""
+
+    class Meta:
+        default_actions = ["get", "list"]
+
+    __tablename__ = "channels"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_cuid)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    channel_type: Mapped[str] = mapped_column(String, nullable=False)
+    config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    default_agent_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="ACTIVE")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    bindings = has_many("ChannelBinding", key="channel_id")
+
+    @action(kind=ActionKind.CREATE)
+    @policy(role_is("admin", "system"))
+    def create(self, name: str, channel_type: str, default_agent_id: str | None = None,
+               config: dict | None = None) -> "Channel":
+        self.id = _cuid()
+        self.name = name
+        self.channel_type = channel_type
+        self.default_agent_id = default_agent_id
+        self.config = config or {}
+        return self
+
+
+class ChannelBinding(Resource):
+    """Maps a thread to a channel. Many-to-many."""
+
+    class Meta:
+        default_actions = ["get", "list"]
+
+    __tablename__ = "channel_bindings"
+    __table_args__ = (
+        UniqueConstraint("thread_id", "channel_id", name="uq_channel_binding"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_cuid)
+    thread_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    channel_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    @action(kind=ActionKind.CREATE)
+    def bind(self, thread_id: str, channel_id: str) -> "ChannelBinding":
+        self.id = _cuid()
+        self.thread_id = thread_id
+        self.channel_id = channel_id
+        return self
+''',
+
+            "src/{{app_name}}/sessions/agent.py": '''from datetime import datetime, UTC
+from enum import StrEnum
+
+from cuid2 import cuid_wrapper
+from sqlalchemy import DateTime, JSON, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from ironbridge.shared.framework import (
+    Resource, action, ActionKind, policy, role_is,
+)
+
+_cuid = cuid_wrapper()
+_utcnow = lambda: datetime.now(UTC)
+
+
+class AgentStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
+
+
+class Agent(Resource):
+    """Agent definition. Owns config (model, instructions, tools), not execution."""
+
+    class Meta:
+        default_actions = ["get", "list"]
+
+    __tablename__ = "agents"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_cuid)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    instructions: Mapped[str | None] = mapped_column(String, nullable=True)
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    tools: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="ACTIVE")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    @action(kind=ActionKind.CREATE)
+    @policy(role_is("admin", "system"))
+    def create(self, name: str, model: str, instructions: str | None = None,
+               tools: dict | None = None) -> "Agent":
+        self.id = _cuid()
+        self.name = name
+        self.model = model
+        self.instructions = instructions
+        self.tools = tools or {}
+        self.status = "ACTIVE"
+        return self
+''',
+
+            "src/{{app_name}}/sessions/broadcast.py": '''# Channel broadcast -- fan-out messages to all bound channels.
+#
+# After a message is appended to a thread, broadcast delivers it
+# to every channel bound to that thread. Each channel adapter
+# decides what to render (text, events, tool calls, etc.).
+#
+# Usage:
+#     from .broadcast import broadcast_message
+#     broadcast_message(thread_id, message_dict)
+
+from ironbridge.shared.framework import step
+
+
+# Adapter registry: channel_type -> adapter instance
+_adapters: dict[str, object] = {}
+
+
+def register_adapter(adapter) -> None:
+    """Register a channel adapter. Call at startup."""
+    _adapters[adapter.channel_type] = adapter
+
+
+def get_adapter(channel_type: str):
+    return _adapters.get(channel_type)
+
+
+@step(retries=2, backoff=2.0, interval=1)
+def broadcast_message(thread_id: str, message: dict) -> None:
+    """Fan-out a message to all channels bound to this thread."""
+    from ironbridge.shared.db import SessionLocal
+    from sqlalchemy import text
+
+    db = SessionLocal()
+    try:
+        result = db.execute(text(
+            "SELECT cb.channel_id, c.channel_type, c.config"
+            " FROM channel_bindings cb"
+            " JOIN channels c ON c.id = cb.channel_id"
+            " WHERE cb.thread_id = :tid AND c.status = 'ACTIVE'"
+        ), {"tid": thread_id})
+
+        for row in result:
+            adapter = get_adapter(row.channel_type)
+            if adapter:
+                try:
+                    adapter.on_message(message, dict(row._mapping))
+                except Exception:
+                    pass  # adapter errors don't break the broadcast
+    finally:
+        db.close()
+
+
+class BaseAdapter:
+    """Base class for channel adapters. Override on_message."""
+    channel_type: str = ""
+
+    def on_message(self, message: dict, channel_config: dict) -> None:
+        """Deliver a message to this channel. Override in subclass."""
+        pass
+''',
+
+            "src/{{app_name}}/sessions/module.py": """from ironbridge.shared.framework import Module
+
+from .thread import Thread
+from .message import Message
+from .channel import Channel, ChannelBinding
+from .agent import Agent
+
+
+class SessionsModule(Module):
+    prefix = "/sessions"
+    resources = [Thread, Message, Channel, ChannelBinding, Agent]
 """,
         },
     )

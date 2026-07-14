@@ -105,8 +105,13 @@ class SqlAlchemyRepository[R: Resource]:
         sort: str | None = None,
         order: str = "asc",
         filters: dict[str, Any] | None = None,
+        query_modifier: Any = None,
     ) -> "PaginatedResult[R]":
         q = self._session.query(self._cls)
+
+        # Apply read policy filter
+        if query_modifier is not None:
+            q = query_modifier(q)
 
         # Apply filters
         if filters:

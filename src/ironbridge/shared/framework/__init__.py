@@ -2,16 +2,24 @@ from . import registry
 from .actions import ActionKind, action
 from .actor import Actor, Origin, from_cron, from_request, from_webhook
 from .defaults import default_action
-from .effects import ActionContext, SendEffect, WorkflowEffect
+from .effects import effect, get_effects, run_effects
 from .data_layer import DataLayer, InMemoryRepository, get_repo
 from .depends import Deps, Providers, get_providers, set_providers
 from .enforcement import GuardFailed, PolicyDenied, can, enforce
 from .validation import ConfigurationError, validate_full, ValidationResult
 from .extension import Extension, resolve_extensions, apply_extensions, run_before_action, run_after_action
+from .extensions import Swagger, TenantScoped, Threaded
 from .graph import ResourceGraph
 from .guards import GuardDef, custom, field_equals, field_set, field_true, guard, in_state, not_deleted, not_in_state
 from .module import Module, init_modules, ready_modules, shutdown_modules
 from .policies import PolicyDef, PolicyVerdict, anyone, has_scope, initiator_is, policy, role_is, same_tenant, system_only
+from .auth import (
+    Role, Membership, register_roles, get_role, get_all_roles,
+    set_scope_hierarchy, PermissionDef, register_permission, get_all_permissions,
+    set_permission_overrides, actor_has_permission, actor_has_role,
+    role, requires, owner, system,
+)
+from .read_policy import ReadPolicyDef, read_filter, tenant_visible, owner_visible, role_visible, apply_read_policy
 from .relationships import belongs_to, has_many, has_one, many_to_many, references, BelongsTo, HasMany, HasOne, ManyToMany, References
 from .resource import Base, Resource
 from .signal import Signal, SignalDef, register_signal_transport

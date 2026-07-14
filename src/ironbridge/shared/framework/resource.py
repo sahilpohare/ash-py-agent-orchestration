@@ -56,11 +56,12 @@ class ResourceMeta(type(Base)):
 
         namespace["__meta__"] = meta
 
-        # --- Inject default actions BEFORE collecting ---
-        if meta.get("default_actions"):
-            inject_defaults(namespace, meta)
+        # --- Extension column injection (before SQLAlchemy processes the class) ---
+        for ext in meta.get("extensions", []):
+            if hasattr(ext, "inject_columns"):
+                ext.inject_columns(namespace, meta)
 
-        # --- Inject tenancy columns ---
+        # --- Legacy: tenant_scoped = True (without TenantScoped extension) ---
         if meta["tenant_scoped"]:
             for col in meta["tenancy_key"]:
                 if col not in namespace:
@@ -70,6 +71,10 @@ class ResourceMeta(type(Base)):
                         index=True,
                         server_default=sa_text("current_setting('app.tenant_id', true)"),
                     )
+
+        # --- Inject default actions BEFORE collecting ---
+        if meta.get("default_actions"):
+            inject_defaults(namespace, meta)
 
         # --- NOW collect actions (inherited + this class + injected defaults) ---
         inherited_actions: dict[str, ActionMeta] = {}

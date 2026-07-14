@@ -63,6 +63,7 @@ def _inspect_input(fn: Callable, action_name: str) -> tuple[type[BaseModel] | No
     params = {
         k: v for k, v in sig.parameters.items()
         if k not in _SKIP_PARAMS
+        and v.kind not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
     }
 
     if not params:

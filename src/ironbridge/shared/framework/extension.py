@@ -27,10 +27,19 @@ if TYPE_CHECKING:
 class Extension:
     """Base class for resource extensions. Override the hooks you need."""
 
+    # --- Metaclass hook (runs during class creation, before SQLAlchemy) ---
+
+    def inject_columns(self, namespace: dict, meta: dict) -> None:
+        """Inject columns into the class namespace before SQLAlchemy processes it.
+        This is the ONLY place to add mapped_column declarations.
+        Called by ResourceMeta.__new__."""
+        pass
+
     # --- Startup hooks (once per resource) ---
 
     def on_resource(self, cls: type) -> None:
-        """Transform the resource class. Add fields, policies, guards."""
+        """Transform the resource class. Add properties, methods, metadata.
+        Called at mount time, after the class is fully created."""
         pass
 
     def on_action(self, cls: type, action_name: str, action_meta: Any) -> None:

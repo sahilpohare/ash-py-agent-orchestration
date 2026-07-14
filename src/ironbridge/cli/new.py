@@ -198,112 +198,26 @@ from ironbridge.shared.framework import on
 
     python -m {snake}_web.main          # run server
     python -m {snake}_web.main migrate  # create tables
+    open http://localhost:8000/docs
 """
 import os
 import sys
 
 os.environ.setdefault("DATABASE_URL", "postgresql://{snake}:{snake}@localhost:5432/{snake}")
 
-from dotenv import load_dotenv
-load_dotenv()
+from fastapi import FastAPI
+from ironbridge_web import Ironbridge
+from {snake}.app import {title}App
+import {snake}.subscriptions  # noqa: F401
 
-DATABASE_URL = os.environ["DATABASE_URL"]
-
-
-def create_app():
-    from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse
-    from dbos import DBOS
-
-    from ironbridge.shared.framework import (
-        Providers, set_providers, ResourceGraph,
-        init_modules, ready_modules, shutdown_modules,
-    )
-    from ironbridge.shared.framework.enforcement import PolicyDenied, GuardFailed
-    from ironbridge.shared.framework.actor import Actor, Origin
-    from ironbridge_web.derive.router import derive_router
-
-    from {snake}.app import {title}App
-    import {snake}.subscriptions  # noqa: F401
-
-    app = FastAPI(title="{title}", version="0.1.0")
-
-    # --- Error handlers ---
-    @app.exception_handler(PolicyDenied)
-    async def _(request: Request, exc: PolicyDenied):
-        return JSONResponse(403, {{"error": "forbidden", "message": str(exc), "policy": exc.policy_name}})
-
-    @app.exception_handler(GuardFailed)
-    async def _(request: Request, exc: GuardFailed):
-        return JSONResponse(409, {{"error": "conflict", "message": str(exc), "guard": exc.guard_name}})
-
-    @app.exception_handler(ValueError)
-    async def _(request: Request, exc: ValueError):
-        return JSONResponse(400, {{"error": "bad_request", "message": str(exc)}})
-
-    # --- Actor middleware (replace with JWT in production) ---
-    @app.middleware("http")
-    async def actor_middleware(request: Request, call_next):
-        request.state.actor = Actor(
-            id=request.headers.get("X-User-Id", "anonymous"),
-            tenant_id=request.headers.get("X-Tenant-Id", "default"),
-            role=request.headers.get("X-User-Role", "admin"),
-            origin=Origin(channel="web"),
-        )
-        return await call_next(request)
-
-    # --- Health ---
-    @app.get("/health")
-    def health():
-        return {{"status": "ok"}}
-
-    # --- DBOS ---
-    DBOS(config={{"name": "{snake}", "system_database_url": DATABASE_URL}})
-    DBOS.launch()
-
-    # --- Providers ---
-    providers = Providers()
-    set_providers(providers)
-
-    # --- Modules ---
-    modules = {title}App.modules
-    init_modules(modules, providers)
-
-    graph = ResourceGraph()
-    graph.build()
-    errors = graph.validate()
-    if errors:
-        for e in errors:
-            print(f"  graph error: {{e}}")
-
-    for mod_cls in modules:
-        for resource in mod_cls.all_resources():
-            prefix = f"/api{{mod_cls.prefix}}" if mod_cls.prefix else "/api"
-            app.include_router(derive_router(resource), prefix=prefix)
-
-    ready_modules(modules)
-
-    @app.on_event("shutdown")
-    def on_shutdown():
-        shutdown_modules(modules)
-
-    return app
-
-
-def migrate():
-    from sqlalchemy import create_engine
-    from ironbridge.shared.framework.resource import Base
-    engine = create_engine(DATABASE_URL)
-    Base.metadata.create_all(engine)
-    print("Tables created.")
-
+app = FastAPI(title="{title}")
+ib = Ironbridge(app, modules={title}App.modules)
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "migrate":
-        migrate()
+        ib.migrate()
     else:
         import uvicorn
-        app = create_app()
         uvicorn.run(app, host="0.0.0.0", port=8000)
 ''')
 

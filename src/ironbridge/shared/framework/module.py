@@ -83,16 +83,11 @@ class Module:
         else:
             explicit_resources = {r: None for r in cls.resources}
 
-        mounted: set[type] = set()
         for resource, custom_path in explicit_resources.items():
             resolved_exts = resolve_extensions(resource, all_extensions, graph)
             apply_extensions(resource, resolved_exts)
             router = derive_router(resource, prefix=custom_path)
             app.include_router(router, prefix=full_prefix)
-            mounted.add(resource)
-
-            if graph:
-                _mount_children(app, resource, full_prefix, graph, all_extensions, mounted)
 
         for sub_module in cls.modules:
             sub_module.mount(app, full_prefix, graph, all_extensions)
